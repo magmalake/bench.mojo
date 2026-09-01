@@ -62,22 +62,30 @@ from std.time import perf_counter_ns
 
 @fieldwise_init
 struct Metric(Copyable, Movable):
-    """What a benchmark's per-iteration count means, and the rate's unit."""
+    """What a benchmark's per-iteration count means, and the rate's unit.
+
+    `unit` is the giga-scaled label the JSON reports against, kept fixed so a
+    stored series stays comparable. `base_unit` is unprefixed, and the human
+    table pairs it with whatever SI prefix actually suits the number -- 873
+    thousand column chunks a second reads as `873.0 KElems/s`, not
+    `0.0009 GElems/s`.
+    """
 
     var name: String
     var unit: String
+    var base_unit: String
 
     @staticmethod
     def bytes() -> Self:
-        return Self("bytes", "GB/s")
+        return Self("bytes", "GB/s", "B/s")
 
     @staticmethod
     def elements() -> Self:
-        return Self("elements", "GElems/s")
+        return Self("elements", "GElems/s", "Elems/s")
 
     @staticmethod
     def flops() -> Self:
-        return Self("flops", "GFLOPS/s")
+        return Self("flops", "GFLOPS/s", "FLOPS/s")
 
 
 # ── The value handed to each benchmark ──────────────────────────────────────
@@ -520,6 +528,21 @@ def _format_ns(ns: Float64) -> String:
     return _round2(ns / 1_000_000_000.0) + " s"
 
 
+def _scaled_rate(giga_per_s: Float64, base_unit: String) -> String:
+    """Pick the SI prefix that puts the number in a readable range.
+
+    The JSON always reports against the fixed giga unit; this is display only.
+    """
+    var per_s = giga_per_s * 1.0e9
+    if per_s >= 1.0e9:
+        return _rate_str(per_s / 1.0e9) + " G" + base_unit
+    if per_s >= 1.0e6:
+        return _rate_str(per_s / 1.0e6) + " M" + base_unit
+    if per_s >= 1.0e3:
+        return _rate_str(per_s / 1.0e3) + " K" + base_unit
+    return _rate_str(per_s) + " " + base_unit
+
+
 def _rate_str(v: Float64) -> String:
     """Rates span orders of magnitude -- 28 GB/s down to 0.008 GElems/s -- so
     a fixed two decimals rounds the slow end to "0.01" and throws the number
@@ -581,7 +604,7 @@ def _table(results: List[BenchResult]) -> String:
         row.append(_format_ns(r.min_ns()) + " - " + _format_ns(r.max_ns()))
         row.append(String(r.iters) + " x " + String(len(r.runs_ns)))
         if r.metric:
-            row.append(_rate_str(r.rate()) + " " + r.metric.value().unit)
+            row.append(_scaled_rate(r.rate(), r.metric.value().base_unit))
         else:
             row.append(String("-"))
         rows.append(row^)

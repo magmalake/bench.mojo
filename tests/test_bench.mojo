@@ -13,6 +13,7 @@ from bench.suite import (
     _format_ns,
     _json_results,
     _rate_str,
+    _scaled_rate,
     _round2,
     _sorted,
     _table,
@@ -97,6 +98,16 @@ def test_metric_units() raises:
     assert_equal(Metric.bytes().unit, String("GB/s"))
     assert_equal(Metric.elements().unit, String("GElems/s"))
     assert_equal(Metric.flops().unit, String("GFLOPS/s"))
+    assert_equal(Metric.bytes().base_unit, String("B/s"))
+    assert_equal(Metric.elements().base_unit, String("Elems/s"))
+
+
+def test_scaled_rate_picks_a_readable_prefix() raises:
+    # Argument is in giga-per-second, as `BenchResult.rate()` returns.
+    assert_equal(_scaled_rate(28.47, String("B/s")), String("28.47 GB/s"))
+    assert_equal(_scaled_rate(0.873e-3, String("Elems/s")), String("873.00 KElems/s"))
+    assert_equal(_scaled_rate(0.0189, String("Elems/s")), String("18.90 MElems/s"))
+    assert_equal(_scaled_rate(0.0000005, String("Elems/s")), String("500.00 Elems/s"))
 
 
 # ── the Benchmark handle ────────────────────────────────────────────────────

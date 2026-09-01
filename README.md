@@ -99,10 +99,12 @@ deviation (n−1, matching pytest-benchmark). Throughput is
 `Metric.bytes()`, `GElems/s` for `Metric.elements()`, `GFLOPS/s` for
 `Metric.flops()`.
 
-Rates in the table widen their fraction as they shrink — two decimals at or
-above 1, three below that, four below 0.1 — because real benchmarks span
-28 GB/s down to 0.008 GElems/s and a fixed two decimals throws the slow end
-away. The JSON always carries full precision.
+The **table** then picks the SI prefix that suits the number — 873 thousand
+column chunks a second reads as `873.00 KElems/s`, not `0.0009 GElems/s` —
+and widens its fraction as values shrink (two decimals at or above 1, three
+below, four below 0.1). That is display only. The **JSON** always reports
+against the fixed giga unit at full precision, so a stored series stays
+comparable even as the displayed prefix changes.
 
 ## The benchmark binary is a CLI
 
