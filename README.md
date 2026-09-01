@@ -200,6 +200,36 @@ decoder.
 reports as `bench_crc32`; that is what `--only` takes and what lands in the
 JSON, so renaming a function renames its history.
 
+## Publishing a history
+
+`--out` gives you one report. `tools/publish.py` turns a stream of them into a
+history, and `benchmarks/index.html` draws it:
+
+```sh
+pixi run -e bench bench -- --out report.json
+python3 tools/publish.py --report report.json --out-dir gh-pages-out
+```
+
+That writes `results/<commit>.json` (the report, verbatim, plus commit and
+timestamp), `results/latest.json`, and `benchmarks/data.json` — the rolling
+file the dashboard reads, capped at 200 runs per machine.
+
+**History is keyed by host.** A run on a laptop and a run on a CI runner are
+not points on the same line, and averaging them would invent a trend that
+never happened. Each run records which machine it came from and the dashboard
+draws one series per benchmark per machine. Re-running the same commit on the
+same machine replaces its entry rather than appending, so a retried job is not
+two data points.
+
+Regressions are flagged when the last five runs are slower than the previous
+five by more than `max(5%, 2 × CV)` of that baseline — so a noisy benchmark
+has to move further before it is called out. Where a benchmark declares a
+throughput the comparison uses it; otherwise it uses the reciprocal of the
+mean time, so a fall is always the bad direction.
+
+Repositories in this org get all of it from one caller workflow — see
+`.github/workflows/bench.yml` in any of the tins.
+
 ## Install as a mojoshelf tin
 
 ```sh
