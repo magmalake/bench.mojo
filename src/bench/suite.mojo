@@ -51,9 +51,17 @@ The resulting binary is its own CLI:
 """
 
 from std.benchmark.compiler import keep
+from std.ffi import external_call
 from std.math import sqrt
 from std.reflection import get_function_name
-from std.sys import argv
+from std.sys import (
+    argv,
+    has_accelerator,
+    num_logical_cores,
+    num_performance_cores,
+    num_physical_cores,
+)
+from std.sys.info import CompilationTarget
 from std.time import perf_counter_ns
 
 
@@ -86,6 +94,159 @@ struct Metric(Copyable, Movable):
     @staticmethod
     def flops() -> Self:
         return Self("flops", "GFLOPS/s", "FLOPS/s")
+
+
+# ── the machine ─────────────────────────────────────────────────────────────
+
+
+def _cstr(s: StringSlice) -> List[UInt8]:
+    var out = List[UInt8]()
+    for b in String(s).as_bytes():
+        out.append(b)
+    out.append(0)
+    return out^
+
+
+def _sysctl_str(name: StringSlice) -> String:
+    """macOS only. Empty string on any failure -- unknown beats invented."""
+    var key = _cstr(name)
+    var size = List[UInt64](length=1, fill=UInt64(512))
+    var buf = List[UInt8](length=512, fill=UInt8(0))
+    var rc = external_call["sysctlbyname", Int32](
+        key.unsafe_ptr(), buf.unsafe_ptr(), size.unsafe_ptr(), Int(0), Int(0)
+    )
+    if rc != 0:
+        return String("")
+    var out = String("")
+    for i in range(Int(size[0])):
+        if buf[i] == 0:
+            break
+        out += chr(Int(buf[i]))
+    return out^
+
+
+def _sysctl_u64(name: StringSlice) -> Int:
+    var key = _cstr(name)
+    var size = List[UInt64](length=1, fill=UInt64(8))
+    var val = List[UInt64](length=1, fill=UInt64(0))
+    var rc = external_call["sysctlbyname", Int32](
+        key.unsafe_ptr(), val.unsafe_ptr(), size.unsafe_ptr(), Int(0), Int(0)
+    )
+    return Int(val[0]) if rc == 0 else 0
+
+
+def _proc_field(path: StringSlice, key: StringSlice) -> String:
+    """First `key: value` line of a /proc file. Empty on any failure."""
+    try:
+        with open(String(path), "r") as f:
+            var text = f.read()
+            for line in text.split("\n"):
+                var colon = line.find(":")
+                if colon < 0:
+                    continue
+                if String(line[byte = 0 : colon]).strip() == String(key):
+                    return String(String(line[byte=colon + 1 :]).strip())
+    except:
+        pass
+    return String("")
+
+
+@fieldwise_init
+struct Host(Copyable, Movable):
+    """What a run was measured on.
+
+    A timing without its machine is not comparable to anything, so every JSON
+    report carries this. Fields that could not be determined are left empty or
+    zero rather than guessed.
+
+    There is no GPU model here on purpose: these are CPU benchmarks, and
+    `accelerator` records only whether the toolchain sees one at all.
+    """
+
+    var cpu: String
+    var os: String
+    var arch: String
+    var physical_cores: Int
+    var logical_cores: Int
+    var performance_cores: Int
+    var memory_bytes: Int
+    var accelerator: Bool
+
+    @staticmethod
+    def detect() -> Self:
+        var cpu = String("")
+        var memory = 0
+
+        @parameter
+        if CompilationTarget.is_macos():
+            cpu = _sysctl_str("machdep.cpu.brand_string")
+            memory = _sysctl_u64("hw.memsize")
+        elif CompilationTarget.is_linux():
+            cpu = _proc_field("/proc/cpuinfo", "model name")
+            var kb = _proc_field("/proc/meminfo", "MemTotal")
+            # "16316360 kB" -- take the leading integer.
+            var digits = String("")
+            for ch in kb:
+                if ch >= "0" and ch <= "9":
+                    digits += ch
+                else:
+                    break
+            if len(digits.codepoints()) > 0:
+                try:
+                    memory = Int(digits) * 1024
+                except:
+                    memory = 0
+
+        var os = String("unknown")
+
+        @parameter
+        if CompilationTarget.is_macos():
+            os = String("macos")
+        elif CompilationTarget.is_linux():
+            os = String("linux")
+
+        var arch = String("unknown")
+
+        @parameter
+        if CompilationTarget.is_x86():
+            arch = String("x86_64")
+        elif CompilationTarget.is_apple_silicon():
+            arch = String("arm64")
+
+        return Self(
+            cpu^,
+            os^,
+            arch^,
+            num_physical_cores(),
+            num_logical_cores(),
+            num_performance_cores(),
+            memory,
+            has_accelerator(),
+        )
+
+    def summary(self) -> String:
+        """One line for the human header."""
+        var out = self.cpu if len(self.cpu.codepoints()) > 0 else String("unknown cpu")
+        out += String(" | ", self.os, "/", self.arch)
+        out += String(" | ", self.physical_cores, " cores")
+        if self.performance_cores != self.physical_cores:
+            out += String(" (", self.performance_cores, " performance)")
+        if self.memory_bytes > 0:
+            out += String(" | ", self.memory_bytes // (1024 * 1024 * 1024), " GiB")
+        return out^
+
+    def as_json(self) -> String:
+        return String(
+            '{"cpu": "', self.cpu,
+            '", "os": "', self.os,
+            '", "arch": "', self.arch,
+            '", "physical_cores": ', self.physical_cores,
+            ', "logical_cores": ', self.logical_cores,
+            ', "performance_cores": ', self.performance_cores,
+            ', "memory_bytes": ', self.memory_bytes,
+            ', "accelerator": ', "true" if self.accelerator else "false",
+            "}",
+        )
 
 
 # ── The value handed to each benchmark ──────────────────────────────────────
@@ -380,6 +541,15 @@ struct BenchSuite(Movable):
                 return True
         return False
 
+    def _config_json(self) -> String:
+        return String(
+            '{"min_runtime_secs": ', self.min_runtime_secs,
+            ', "num_warmup_iters": ', self.num_warmup_iters,
+            ', "num_repetitions": ', self.num_repetitions,
+            ', "max_iters": ', self.max_iters,
+            "}",
+        )
+
     # -- execution ----------------------------------------------------------
 
     def _run_one(self, b: _Bench) raises -> BenchResult:
@@ -454,10 +624,12 @@ struct BenchSuite(Movable):
                 print("running", b.name, "...")
             results.append(self._run_one(b))
 
-        var payload = _json_results(results)
+        var host = Host.detect()
+        var payload = _json_report(host, self._config_json(), results)
         if self.json:
             print(payload)
         else:
+            print(host.summary())
             print(_table(results))
         if self.out_path.byte_length() > 0:
             with open(self.out_path, "w") as f:
@@ -480,12 +652,26 @@ def _json_string_array(names: List[String]) -> String:
     return out^
 
 
-def _json_results(results: List[BenchResult]) -> String:
-    """One JSON array of objects, in the order the benchmarks ran.
+def _json_report(
+    host: Host, config: String, results: List[BenchResult]
+) -> String:
+    """The full report: what it ran on, how it was run, and what it measured.
 
-    Deliberately no commit or timestamp: the binary has no business shelling
-    out to git. Whatever saves these wraps them in that envelope.
+    Still no commit or timestamp -- the binary has no business shelling out to
+    git, and whatever saves these adds them. The machine is different: a
+    timing is not comparable to anything without it, and the binary is the
+    only thing that knows for certain.
     """
+    return String(
+        '{"host": ', host.as_json(),
+        ', "config": ', config,
+        ', "results": ', _json_results(results),
+        "}",
+    )
+
+
+def _json_results(results: List[BenchResult]) -> String:
+    """The measurements, in the order the benchmarks ran."""
     var out = String("[\n")
     for i in range(len(results)):
         ref r = results[i]

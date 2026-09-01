@@ -10,7 +10,9 @@ from std.testing import TestSuite, assert_equal, assert_true, assert_almost_equa
 
 from bench import Benchmark, BenchResult, BenchSuite, Metric, keep
 from bench.suite import (
+    Host,
     _format_ns,
+    _json_report,
     _json_results,
     _rate_str,
     _scaled_rate,
@@ -159,6 +161,29 @@ def test_json_omits_throughput_when_undeclared() raises:
     results.append(_result([1.0]))
     var out = _json_results(results)
     assert_true("throughput" not in out)
+
+
+def test_host_reports_a_usable_machine() raises:
+    """cpu and memory may be unknown on an unfamiliar platform; the rest comes
+    from std.sys and always resolves."""
+    var h = Host.detect()
+    assert_true(h.os == String("macos") or h.os == String("linux"))
+    assert_true(h.arch == String("arm64") or h.arch == String("x86_64"))
+    assert_true(h.physical_cores > 0)
+    assert_true(h.logical_cores >= h.physical_cores)
+    assert_true('"physical_cores": ' in h.as_json())
+    assert_true(h.os in h.as_json())
+    assert_true(len(h.summary().codepoints()) > 0)
+
+
+def test_report_wraps_host_config_and_results() raises:
+    var results = List[BenchResult]()
+    results.append(_result([1.0]))
+    var out = _json_report(Host.detect(), String('{"k": 1}'), results)
+    assert_true(out.startswith('{"host": {'))
+    assert_true('"config": {"k": 1}' in out)
+    assert_true('"results": [' in out)
+    assert_true(out.endswith("}"))
 
 
 def test_json_separates_multiple_results() raises:

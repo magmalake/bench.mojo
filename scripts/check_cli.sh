@@ -19,15 +19,34 @@ list="$("$bin" --list)"
 [[ "$list" == *'"bench_max"'* ]] || fail "--list missing bench_max: $list"
 [[ "$list" != *"_helper_ignored_by_discovery"* ]] || fail "--list leaked a helper"
 
-# --only restricts the run; --json makes the output a bare JSON array.
+# --only restricts the run; --json replaces the table with the JSON report.
 json="$("$bin" --only bench_sum --json)"
-[[ "$json" == \[* ]] || fail "--json did not start with '[': $json"
+[[ "$json" == \{* ]] || fail "--json did not start with '{': $json"
 [[ "$json" == *'"name": "bench_sum"'* ]] || fail "--json missing bench_sum"
 [[ "$json" != *"bench_max"* ]] || fail "--only did not exclude bench_max"
 [[ "$json" == *'"throughput_unit": "GElems/s"'* ]] || fail "--json missing throughput"
 [[ "$json" == *'"runs_ns": ['* ]] || fail "--json missing per-repetition runs"
-python3 -c "import json,sys; d=json.load(sys.stdin); assert len(d)==1 and len(d[0]['runs_ns'])==3, d" <<<"$json" \
-  || fail "--json is not valid JSON with 3 repetitions"
+
+# A script file rather than `python3 -c`, because stdin is carrying the JSON.
+cat > "$work/check_report.py" <<'PYEOF'
+import json, sys
+
+d = json.load(sys.stdin)
+assert len(d["results"]) == 1, d
+assert len(d["results"][0]["runs_ns"]) == 3, d
+assert d["config"]["num_repetitions"] == 3, d
+
+h = d["host"]
+# cpu and memory can legitimately be unknown on an unfamiliar platform; the
+# rest comes from std.sys and always resolves.
+assert h["os"] in ("macos", "linux"), h
+assert h["arch"] in ("arm64", "x86_64"), h
+assert h["physical_cores"] > 0 and h["logical_cores"] > 0, h
+print("  host:", h["cpu"] or "(unknown cpu)", h["os"] + "/" + h["arch"],
+      h["physical_cores"], "cores,", h["memory_bytes"], "bytes")
+PYEOF
+python3 "$work/check_report.py" <<<"$json" \
+  || fail "--json report is not the expected shape"
 
 # --skip is the complement.
 skipped="$("$bin" --skip bench_sum --json)"
@@ -37,7 +56,7 @@ skipped="$("$bin" --skip bench_sum --json)"
 # --out writes the same payload to a file.
 "$bin" --only bench_sum --out "$work/r.json" >/dev/null
 [[ -s "$work/r.json" ]] || fail "--out wrote nothing"
-python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d[0]['name']=='bench_sum', d" "$work/r.json" \
+python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['results'][0]['name']=='bench_sum', d" "$work/r.json" \
   || fail "--out did not write valid JSON"
 
 # An unknown name is an error, not a silent empty run.

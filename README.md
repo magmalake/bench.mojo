@@ -121,20 +121,43 @@ silently running nothing.
 
 ## The JSON
 
-One array, in the order the benchmarks ran. No commit and no timestamp: the
-binary has no business shelling out to git, so whatever saves these wraps them
-in that envelope.
+Three parts: what it ran on, how it was run, and what it measured.
 
 ```json
-[
-  {"name": "crc32", "unit": "ns", "iters": 23, "reps": 5,
-   "mean_ns": 44834000.0, "min_ns": 44573931.0, "max_ns": 45787931.0,
-   "median_ns": 44659827.0, "stddev_ns": 512344.1,
-   "runs_ns": [44573931.0, 44659827.0, 45378517.0, 45787931.0, 44030066.0],
-   "throughput_metric": "bytes", "throughput_unit": "GB/s",
-   "throughput_count": 67108864, "throughput": 1.4968}
-]
+{
+  "host": {"cpu": "Apple M4", "os": "macos", "arch": "arm64",
+           "physical_cores": 10, "logical_cores": 10, "performance_cores": 4,
+           "memory_bytes": 25769803776, "accelerator": true},
+  "config": {"min_runtime_secs": 1.0, "num_warmup_iters": 2,
+             "num_repetitions": 5, "max_iters": 100000000},
+  "results": [
+    {"name": "crc32", "unit": "ns", "iters": 23, "reps": 5,
+     "mean_ns": 44834000.0, "min_ns": 44573931.0, "max_ns": 45787931.0,
+     "median_ns": 44659827.0, "stddev_ns": 512344.1,
+     "runs_ns": [44573931.0, 44659827.0, 45378517.0, 45787931.0, 44030066.0],
+     "throughput_metric": "bytes", "throughput_unit": "GB/s",
+     "throughput_count": 67108864, "throughput": 1.4968}
+  ]
+}
 ```
+
+**`host` is there because a timing without its machine is not comparable to
+anything.** Cores, OS and architecture come from `std.sys` and always resolve;
+the CPU model and memory come from `sysctlbyname` on macOS and `/proc` on
+Linux, and are left empty or zero if they cannot be read — unknown beats
+invented. `accelerator` records only whether the toolchain can see one: there
+is no GPU model, because these are CPU benchmarks and a GPU field would imply
+the number depended on it.
+
+The human table prints the same thing as a one-line header:
+
+```
+Apple M4 | macos/arm64 | 10 cores (4 performance) | 24 GiB
+```
+
+Still no commit and no timestamp: the binary has no business shelling out to
+git, and whatever saves a report adds them. The machine is different — the
+binary is the only thing that knows it for certain.
 
 `throughput_*` fields are omitted entirely when a benchmark declares no
 metric.
