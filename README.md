@@ -147,6 +147,32 @@ type-equality predicate on either toolchain right now, so a `bench_*` helper
 with a different signature is a compile error rather than a silent skip —
 prefix helpers with `_`.
 
+**`keep` everything the timed closure captures, after `b.iter`.** Mojo
+destroys a value at its last *use*, and a capture does not count — so a
+schema, a selection list, or a buffer that the closure reads but the body
+never mentions again is freed while the timed loop is still running. It
+surfaces as a crash or as nonsense inside the library under test, not as a
+lifetime error:
+
+```mojo
+def bench_read(mut b: Benchmark) raises:
+    var file = build()
+    var select: List[String] = ["id"]
+
+    @parameter
+    def call() raises:
+        keep(read(file, select.copy()))
+
+    b.iter[call]()
+    keep(file)        # both of these are load-bearing
+    keep(select)      # without it, `select` dies mid-benchmark
+```
+
+The rule: after `b.iter`, `keep` every variable the closure touched. It costs
+nothing and the failure mode is ugly — one of these missing produced
+`String span ends on 1 which is not a codepoint boundary` from deep inside a
+decoder.
+
 **Benchmark names are the function names minus nothing.** `bench_crc32`
 reports as `bench_crc32`; that is what `--only` takes and what lands in the
 JSON, so renaming a function renames its history.
