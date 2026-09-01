@@ -1,0 +1,12 @@
+Copyright 2026 Marius Seritan
+
+This software is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+This product includes software design derived from marrow
+(https://github.com/kszucs/marrow), Copyright the marrow authors,
+licensed under the Apache License, Version 2.0. The BenchSuite design —
+module-level benchmark discovery, the CLI on the benchmark binary, the
+throughput probe call, and keeping per-repetition timings — follows marrow's
+`marrow/testing/bench.mojo`. The implementation here was written from
+scratch against a newer toolchain.
