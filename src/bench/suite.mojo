@@ -207,10 +207,14 @@ struct Host(Copyable, Movable):
 
         var arch = String("unknown")
 
+        # `has_neon` rather than `is_apple_silicon`: the latter came back false
+        # on a GitHub macOS runner, leaving arch "unknown" and poisoning the
+        # host key. Every arm64 target has NEON, which is the property we
+        # actually mean here.
         @parameter
         if CompilationTarget.is_x86():
             arch = String("x86_64")
-        elif CompilationTarget.is_apple_silicon():
+        elif CompilationTarget.has_neon():
             arch = String("arm64")
 
         return Self(

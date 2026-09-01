@@ -67,6 +67,8 @@ fi
 # The default output is the human table.
 table="$("$bin" --only bench_sum)"
 [[ "$table" == *"benchmark"* ]] || fail "table missing header: $table"
-[[ "$table" == *"GElems/s"* ]] || fail "table missing rate column"
+# Not "GElems/s": the table scales the prefix to the number, so a slower
+# machine legitimately reports MElems/s or KElems/s here.
+[[ "$table" == *"Elems/s"* ]] || fail "table missing rate column: $table"
 
 echo "check_cli: ok"
