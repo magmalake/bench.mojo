@@ -99,6 +99,11 @@ deviation (n−1, matching pytest-benchmark). Throughput is
 `Metric.bytes()`, `GElems/s` for `Metric.elements()`, `GFLOPS/s` for
 `Metric.flops()`.
 
+Rates in the table widen their fraction as they shrink — two decimals at or
+above 1, three below that, four below 0.1 — because real benchmarks span
+28 GB/s down to 0.008 GElems/s and a fixed two decimals throws the slow end
+away. The JSON always carries full precision.
+
 ## The benchmark binary is a CLI
 
 | flag | effect |

@@ -9,7 +9,14 @@ that asserts on wall-clock is a test that fails on a busy CI runner.
 from std.testing import TestSuite, assert_equal, assert_true, assert_almost_equal
 
 from bench import Benchmark, BenchResult, BenchSuite, Metric, keep
-from bench.suite import _format_ns, _json_results, _round2, _sorted, _table
+from bench.suite import (
+    _format_ns,
+    _json_results,
+    _rate_str,
+    _round2,
+    _sorted,
+    _table,
+)
 
 
 def _result(var runs: List[Float64]) -> BenchResult:
@@ -158,6 +165,14 @@ def test_format_ns_picks_a_readable_unit() raises:
     assert_equal(_format_ns(1_500.0), String("1.50 us"))
     assert_equal(_format_ns(2_500_000.0), String("2.50 ms"))
     assert_equal(_format_ns(3_000_000_000.0), String("3.00 s"))
+
+
+def test_rate_widens_the_fraction_as_the_value_shrinks() raises:
+    # A fixed two decimals would render the last two as 0.01 and 0.00.
+    assert_equal(_rate_str(28.4712), String("28.47"))
+    assert_equal(_rate_str(0.8123), String("0.812"))
+    assert_equal(_rate_str(0.008123), String("0.0081"))
+    assert_equal(_rate_str(1.0), String("1.00"))
 
 
 def test_round2_always_gives_two_decimals() raises:

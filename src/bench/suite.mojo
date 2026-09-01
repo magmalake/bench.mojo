@@ -520,19 +520,39 @@ def _format_ns(ns: Float64) -> String:
     return _round2(ns / 1_000_000_000.0) + " s"
 
 
+def _rate_str(v: Float64) -> String:
+    """Rates span orders of magnitude -- 28 GB/s down to 0.008 GElems/s -- so
+    a fixed two decimals rounds the slow end to "0.01" and throws the number
+    away. Widen the fraction as the value shrinks."""
+    if v >= 1.0:
+        return _round(v, 2)
+    if v >= 0.1:
+        return _round(v, 3)
+    return _round(v, 4)
+
+
 def _round2(v: Float64) -> String:
-    """Two decimal places. `String(Float64)` prints far more than a table
+    return _round(v, 2)
+
+
+def _round(v: Float64, places: Int) -> String:
+    """Fixed decimal places. `String(Float64)` prints far more than a table
     column wants, and there is no format spec to lean on here."""
-    var scaled = round(v * 100.0) / 100.0
+    var factor = Float64(1)
+    for _ in range(places):
+        factor *= 10.0
+    var scaled = round(v * factor) / factor
     var s = String(scaled)
     var dot = s.find(".")
     if dot < 0:
-        return s + ".00"
+        s += "."
+        dot = s.byte_length() - 1
     var frac = s.byte_length() - dot - 1
-    if frac == 1:
-        return s + "0"
-    if frac > 2:
-        return String(s[byte = 0 : dot + 3])
+    if frac > places:
+        return String(s[byte = 0 : dot + places + 1])
+    while frac < places:
+        s += "0"
+        frac += 1
     return s^
 
 
@@ -561,7 +581,7 @@ def _table(results: List[BenchResult]) -> String:
         row.append(_format_ns(r.min_ns()) + " - " + _format_ns(r.max_ns()))
         row.append(String(r.iters) + " x " + String(len(r.runs_ns)))
         if r.metric:
-            row.append(_round2(r.rate()) + " " + r.metric.value().unit)
+            row.append(_rate_str(r.rate()) + " " + r.metric.value().unit)
         else:
             row.append(String("-"))
         rows.append(row^)
