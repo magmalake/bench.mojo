@@ -4,8 +4,10 @@ A small self-hosted benchmark harness for Mojo: discovers the benchmarks in a
 file, calibrates an iteration count, times several repetitions, and prints a
 table or a JSON array.
 
-It exists because `std.benchmark` cannot currently do this on both toolchains
-magmalake targets, and because a mean on its own is not enough to report from.
+It exists because `std.benchmark` cannot express a benchmark that reads data
+it did not build inside the timed region — not on nightly, and the ways round
+that differ per toolchain — and because a mean on its own is not enough to
+report from.
 
 ```mojo
 from bench import Benchmark, BenchSuite, Metric, keep
@@ -31,11 +33,11 @@ def main() raises:
 ```
 
 ```
-| benchmark      | mean     | min - max           | iters x reps | rate         |
-| -------------- | -------- | ------------------- | ------------ | ------------ |
-| crc32          | 44.83 ms | 44.57 ms - 45.79 ms | 23 x 5       | 1.50 GB/s    |
-| murmur3_x86_32 | 39.91 ms | 39.74 ms - 40.55 ms | 26 x 5       | 1.68 GB/s    |
-| xxh64          | 51.94 ms | 51.66 ms - 52.56 ms | 20 x 5       | 1.29 GB/s    |
+| benchmark            | mean     | min - max           | iters x reps | rate      |
+| -------------------- | -------- | ------------------- | ------------ | --------- |
+| bench_crc32          | 45.33 ms | 45.14 ms - 45.53 ms | 26 x 5       | 1.48 GB/s |
+| bench_murmur3_x86_32 | 40.21 ms | 40.08 ms - 40.32 ms | 30 x 5       | 1.67 GB/s |
+| bench_xxh64          | 52.17 ms | 51.92 ms - 52.35 ms | 22 x 5       | 1.29 GB/s |
 ```
 
 ## Why not `std.benchmark`
