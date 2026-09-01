@@ -167,12 +167,22 @@ bench = "mojo run -I src -I $CONDA_PREFIX/lib/mojo bench/bench_mine.mojo"
 bench = ["stable", "bench"]
 ```
 
-Consume it on **stable**: magmalake tins build their packages with
-`mojo-compiler 1.0.0`, and nightly cannot load a `.mojopkg` that stable
-produced. That is a packaging constraint across the whole org, not a property
-of this harness — the source compiles and its tests pass on both toolchains,
-which is what this repo's CI checks. A repo vendoring the source with
-`-I ../bench.mojo/src` gets both.
+Consume the **package** on stable, or the **source** on either.
+
+A precompiled Mojo package (`.mojoc` — `.mojopkg` is the deprecated spelling,
+as is `mojo package` for `mojo precompile`) is stamped with the exact compiler
+version that produced it and refused by any other:
+
+```
+error: Mojo precompiled file is incompatible with the current version of the
+Mojo compiler. Precompiled file 'bench.mojoc' version 1.0.0 is older than
+compiler version 1.1.0.dev2026090105.
+```
+
+magmalake tins build with `mojo-compiler 1.0.0`, so a tin consumed as a
+package is stable-only — an org-wide constraint that has nothing to do with
+this harness. Vendoring the source (`-I ../bench.mojo/src`) works on both, and
+that is what this repo's own CI does.
 
 ## Test
 
