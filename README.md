@@ -162,9 +162,15 @@ bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "..." }
 bench = "mojo run -I src -I $CONDA_PREFIX/lib/mojo bench/bench_mine.mojo"
 
 [environments]
-bench = ["nightly", "bench"]
-bench-stable = ["stable", "bench"]
+bench = ["stable", "bench"]
 ```
+
+Consume it on **stable**: magmalake tins build their packages with
+`mojo-compiler 1.0.0`, and nightly cannot load a `.mojopkg` that stable
+produced. That is a packaging constraint across the whole org, not a property
+of this harness — the source compiles and its tests pass on both toolchains,
+which is what this repo's CI checks. A repo vendoring the source with
+`-I ../bench.mojo/src` gets both.
 
 ## Test
 
