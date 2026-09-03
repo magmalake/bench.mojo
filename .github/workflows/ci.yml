@@ -27,6 +27,9 @@ jobs:
       - name: Unit tests
         run: pixi run -e ${{ matrix.env }} test
 
+      - name: Lint (mojolint --lsp)
+        run: pixi run -e ${{ matrix.env }} lint
+
       # Covers the __functions_in_module() discovery path and every CLI flag,
       # which the unit tests cannot reach — see tests/example_bench.mojo.
       - name: CLI
