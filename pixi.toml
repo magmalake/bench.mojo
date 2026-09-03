@@ -13,6 +13,10 @@ test = "mojo run -I src tests/test_bench.mojo"
 check-cli = "bash scripts/check_cli.sh"
 example = "mojo run -I src tests/example_bench.mojo"
 
+# mojolint (lint-mojo, below): the origin and threading mistakes the compiler
+# lets through, with mojo-lsp-server behind the rules. Exit 1 on findings.
+lint = { cmd = "mojolint --lsp -I src src tests" }
+
 # ── pixi-build: consumable as a pixi source dependency ──────────────────────
 # Conda package name is bench-mojo; the Mojo import stays `from bench import …`.
 [package]
@@ -44,3 +48,9 @@ mojo-compiler = "==1.0.0"
 [environments]
 default = ["nightly"]
 stable = ["stable"]
+
+[dependencies]
+# Added by `pixi shelf add lint-mojo`: the linter comes from GitHub as a pixi
+# source dependency pinned at the revision mojoshelf published, and builds
+# the `mojolint` executable into every environment next to mojo-lsp-server.
+lint-mojo = { git = "https://github.com/magmalake/lint.mojo.git", rev = "2a12807b7847984aff2c8bf148b0eb7515a99844" }
