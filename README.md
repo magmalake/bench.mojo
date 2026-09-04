@@ -180,6 +180,74 @@ below, four below 0.1). That is display only. The **JSON** always reports
 against the fixed giga unit at full precision, so a stored series stays
 comparable even as the displayed prefix changes.
 
+## Whether the run is worth believing
+
+Everything above measures the code. None of it can tell whether the *machine*
+was the same machine for the whole run — and on a shared one it often is not.
+Here is one parquet.mojo benchmark, identical code, identical fixture,
+identical binary, on an idle M4 and against competing CPU-bound threads:
+
+| competing threads | p50 |
+|---|---|
+| 0 | **31.2 ms** |
+| 2 | 33.5 ms |
+| 4 | 39.1 ms |
+| 8 | 50.6 ms |
+| 12 | 68.8 ms |
+| 16 | 88.5 ms |
+
+Nothing in the timings says which of those a table is showing. Worse, the
+longer a run takes the more of someone else's build it is likely to catch, so
+a benchmark measured in a seven-benchmark suite looks slower than the same
+benchmark measured alone — and the harness appears to have made the answer
+depend on which benchmarks were selected. It did not; the machine did.
+
+So the harness measures the machine too, and the line under the table is the
+verdict:
+
+```
+machine: steady — reference work within 1.1% across the run; load average 1.24; bench_read_big re-timed within 0.4%
+```
+
+Three checks, each catching something the others cannot:
+
+- **A reference kernel** — a fixed dependent integer chain, no memory, no
+  allocation — timed either side of every benchmark. Its duration is a proxy
+  for how fast this core is running *right now*, and each result records the
+  slower of the two probes that bracketed it. The baseline is the **median**
+  probe, not the fastest: a core coming out of idle spends a moment above the
+  clock it can hold (measured on an M4: 30% faster in the first tenth of a
+  second), and treating that burst as the standard would condemn every honest
+  run after it. Calibration therefore spins until the ramp flattens before
+  fixing the reference.
+- **A recheck.** The first benchmark is timed again at the end of the run, on
+  the iteration count it calibrated, and the two headlines are compared. This
+  is the direct test of the property a harness owes its readers — a printed
+  number must not depend on what else was selected, or on when in the run it
+  was taken. It costs one repetition; `--no-recheck` opts out.
+- **The load average**, from the OS. The first two checks compare the run
+  against itself, so a machine that was busy from start to finish passes both
+  while every number on it is inflated — which is precisely the case above.
+  Only the operating system can report that, so it is asked. The budget is
+  half the machine's cores, never below 2; an unknown load is never held
+  against a run.
+
+A run that fails any of the three prints what failed and by how much instead
+of that one line, and `--strict` turns it into a non-zero exit, so whatever
+publishes benchmark numbers can refuse to publish that run:
+
+```
+machine: NOT STEADY — these numbers are not comparable
+  WARNING: the load average was 9.40 on a machine budgeted for 5.00. Something
+  else was running, and everything below may be inflated by it — uniformly,
+  which is why the timings themselves look consistent.
+  Re-run on an idle machine. `--strict` turns this into a non-zero exit.
+```
+
+The whole verdict is in the JSON as `stability`, and each result carries the
+`reference_ns` it was judged by. None of this changes a measurement; it
+changes whether one can be read as if it were comparable.
+
 ## The benchmark binary is a CLI
 
 | flag | effect |
@@ -190,13 +258,16 @@ comparable even as the displayed prefix changes.
 | `--json` | print results as JSON instead of the table |
 | `--out PATH` | also write the JSON to `PATH` |
 | `--batched` | force batched timing, giving up the percentiles |
+| `--no-recheck` | skip re-timing the first benchmark at the end of the run |
+| `--strict` | exit non-zero when the run cannot be vouched for |
 
 `--only` and `--skip` raise on a name that does not exist, rather than
 silently running nothing.
 
 ## The JSON
 
-Three parts: what it ran on, how it was run, and what it measured.
+Four parts: what it ran on, how it was run, whether the run holds up, and what
+it measured.
 
 ```json
 {
@@ -206,7 +277,20 @@ Three parts: what it ran on, how it was run, and what it measured.
   "config": {"min_runtime_secs": 1.0, "num_warmup_iters": 2,
              "num_repetitions": 5, "max_iters": 100000000,
              "max_samples": 20000, "resolution_factor": 100,
-             "timer_resolution_ns": 1000.0, "force_batched": false},
+             "timer_resolution_ns": 1000.0, "force_batched": false,
+             "recheck": true, "stability_tolerance": 0.05,
+             "reference_reps": 1200},
+  "stability": {"ok": true, "tolerance": 0.05, "reference_probes": 3,
+                "reference_baseline_ns": 1104000.0,
+                "reference_best_ns": 1101000.0,
+                "reference_worst_ns": 1116000.0,
+                "reference_spread": 0.0136, "slowest_ratio": 1.0109,
+                "steady": true, "rechecked": true,
+                "recheck_name": "bench_crc32",
+                "recheck_before_ns": 44659827.0,
+                "recheck_after_ns": 44712004.0, "recheck_delta": 0.0012,
+                "reproducible": true, "load_average": 1.24,
+                "load_budget": 5.0, "quiet": true},
   "results": [
     {"name": "crc32", "unit": "ns", "iters": 23, "reps": 5,
      "sampling": "per-iteration",

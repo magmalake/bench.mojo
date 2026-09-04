@@ -21,4 +21,11 @@ times several repetitions, and reports a table or JSON. Works on stable Mojo
         BenchSuite.run[__functions_in_module()]()
 """
 
-from .suite import Benchmark, BenchResult, BenchSuite, Metric, keep
+from .suite import (
+    Benchmark,
+    BenchResult,
+    BenchSuite,
+    Metric,
+    Stability,
+    keep,
+)

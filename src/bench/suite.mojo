@@ -52,6 +52,39 @@ about what it was computed over. Retained samples are capped at `max_samples`
 kept-versus-seen samples is printed too, because a percentile over a subsample
 is honest only if it is labelled as one.
 
+Whether the run is worth believing at all
+-----------------------------------------
+
+Everything above measures the code. None of it can tell whether the *machine*
+was the same machine for the whole run, and on a shared one it frequently is
+not: another process takes a performance core, the scheduler drops the thread
+onto an efficiency core, the package throttles. A benchmark that is 32 ms on
+an idle machine reports 47 ms against a handful of competing threads and 62 ms
+against a dozen -- identical code, identical fixture, identical binary. Nothing
+in the timings says which of those a table is showing, and the longer a run
+takes, the more likely it is to have caught someone else's build.
+
+So the harness measures the machine as well, and `Stability` is the verdict:
+
+* **A reference kernel** -- a fixed dependent integer chain, no memory, no
+  allocation -- is timed either side of every benchmark. Its duration is a
+  proxy for how fast this core is running right now, and every result records
+  the slower of the two probes that bracketed it. If the machine changed
+  speed mid-run, the row that ran while it was slow can be named.
+* **A recheck**: the first benchmark is timed again at the end of the run, on
+  the iteration count it calibrated. This is the direct test of the property
+  a harness owes its readers -- that a printed number does not depend on what
+  else was selected or on when in the run it was taken -- and it costs one
+  repetition. `--no-recheck` opts out.
+* **The load average**, read from the OS. Both checks above compare the run
+  against itself, so a machine that was busy for the whole run passes both
+  while every number on it is wrong. That is the case that produced the 1.9x
+  spread, and only the operating system can report it.
+
+A clean run says so in one line under the table. A run that fails any of the
+three says that instead, loudly, and `--strict` makes it a non-zero exit so
+whatever publishes benchmark numbers can refuse to publish that one.
+
 Writing a benchmark::
 
     from harness import Benchmark, BenchSuite, Metric, keep
@@ -83,6 +116,8 @@ The resulting binary is its own CLI:
     --json            print results as JSON instead of a table
     --out PATH        also write the JSON to PATH
     --batched         force batched timing, giving up the percentiles
+    --no-recheck      skip re-timing the first benchmark at the end
+    --strict          exit non-zero if the run cannot be vouched for
 """
 
 from std.benchmark.compiler import keep
@@ -91,6 +126,7 @@ from std.math import sqrt
 from std.reflection import get_function_name
 from std.sys import (
     argv,
+    exit,
     has_accelerator,
     num_logical_cores,
     num_performance_cores,
@@ -347,6 +383,141 @@ def _next_rand(mut state: UInt64) -> UInt64:
     return state * UInt64(0x2545F4914F6CDD1D)
 
 
+# ── How fast the machine was ────────────────────────────────────────────────
+
+
+comptime _REFERENCE_INNER = 1024
+"""Trips of the dependent chain in one unit of reference work."""
+
+comptime _REFERENCE_TARGET_NS = 1_000_000.0
+"""What one reference measurement is calibrated to cost: about a millisecond,
+short enough to take one either side of every benchmark for free."""
+
+comptime _REFERENCE_MAX_REPS = 1 << 22
+"""Ceiling on the calibrated repetition count, so a machine whose clock says
+nothing cannot spin here forever."""
+
+comptime _REFERENCE_SETTLE_MIN_NS = 250_000_000.0
+"""Floor on the settling spin, in wall time. A core coming out of idle runs a
+short burst above the clock it can hold: on an M4 the same kernel measures 30%
+faster in the first tenth of a second than it does for the rest of the run.
+Calibrating inside that window fixes the reference to a speed the machine will
+not keep, and every probe afterwards then looks like interference."""
+
+comptime _REFERENCE_SETTLE_CAP_NS = 1_000_000_000.0
+"""Ceiling on the settling spin. A machine whose speed never stops moving gets
+a second of patience and then a reference measured anyway -- and, since the
+drift is real, a warning about it."""
+
+
+def _reference_kernel(reps: Int) -> UInt64:
+    """A fixed amount of work whose duration is a proxy for CPU speed.
+
+    Every step depends on the one before it, so this measures how fast a single
+    core executes a serial chain and nothing else: no memory traffic, no
+    allocation, no syscalls, nothing a benchmark body might legitimately change
+    the cost of. Two measurements of it, taken minutes apart on an idle
+    machine, agree to a fraction of a percent.
+
+    Args:
+        reps: How many units of `_REFERENCE_INNER` steps to run.
+
+    Returns:
+        The accumulator, which the caller must `keep`.
+    """
+    var acc = UInt64(0x2545F4914F6CDD1D)
+    for _ in range(reps):
+        for i in range(_REFERENCE_INNER):
+            acc = acc * UInt64(6364136223846793005) + UInt64(i) + UInt64(1)
+    return acc
+
+
+def _reference_once(reps: Int) -> Float64:
+    """Time one run of the kernel, in nanoseconds."""
+    var t0 = perf_counter_ns()
+    var acc = _reference_kernel(reps)
+    var dt = Float64(perf_counter_ns() - t0)
+    keep(acc)
+    return dt
+
+
+def _grow_reference_reps(var reps: Int) -> Int:
+    """Grow a repetition count until one run clears the target duration."""
+    if reps < 1:
+        reps = 1
+    while reps < _REFERENCE_MAX_REPS:
+        var dt = _reference_once(reps)
+        if dt >= _REFERENCE_TARGET_NS:
+            break
+        if dt <= 0.0:
+            reps = min(reps * 8, _REFERENCE_MAX_REPS)
+        else:
+            var scaled = Float64(reps) * _REFERENCE_TARGET_NS / dt * 1.2
+            reps = min(max(Int(scaled), reps + 1), _REFERENCE_MAX_REPS)
+    return reps
+
+
+def _calibrate_reference() -> Int:
+    """Repetitions that make one reference measurement cost about a
+    millisecond here, measured once the core has come up to speed.
+
+    The settling pass is not a nicety. A core that has been idle starts at a
+    low clock and boosts over the first tens of milliseconds of sustained
+    work: measured on an M4, the same kernel takes 947 us on the first attempt
+    and 370 us twenty attempts later, a 2.6x ramp with nothing else running.
+    Calibrating during that would fix the reference at whatever speed the
+    machine happened to be at when the process started, and every probe
+    afterwards would disagree with it -- a contention warning on every run,
+    which is worse than no warning at all.
+
+    So: grow a rough count, spin until the ramp flattens out -- two probes in
+    a row that fail to beat the best by a percent -- and only then calibrate
+    against the speed the benchmarks themselves will see. In practice that
+    costs a tenth of a second, once, at the start of a run.
+    """
+    var reps = _grow_reference_reps(1)
+
+    var start = perf_counter_ns()
+    var best = _reference_ns(reps)
+    var flat = 0
+    while True:
+        var elapsed = Float64(perf_counter_ns() - start)
+        if elapsed >= _REFERENCE_SETTLE_CAP_NS:
+            break
+        if flat >= 2 and elapsed >= _REFERENCE_SETTLE_MIN_NS:
+            break
+        var now = _reference_ns(reps)
+        if now < best:
+            best = now
+            flat = 0
+        elif now <= best * 1.01:
+            flat += 1
+        else:
+            flat = 0
+
+    return _grow_reference_reps(reps)
+
+
+def _reference_ns(reps: Int) -> Float64:
+    """The fastest of three back-to-back kernel runs.
+
+    The fastest, not the mean: what is wanted is the best this core managed in
+    this window, so that a probe only reads slow when the machine could not do
+    better. Taking the minimum makes the contention warning hard to trigger by
+    accident, which is the right bias for something that tells a person their
+    numbers are worthless.
+
+    Args:
+        reps: The calibrated repetition count.
+    """
+    var best = _reference_once(reps)
+    for _ in range(2):
+        var dt = _reference_once(reps)
+        if dt < best:
+            best = dt
+    return best
+
+
 # ── The value handed to each benchmark ──────────────────────────────────────
 
 
@@ -487,6 +658,8 @@ struct BenchResult(Copyable, Movable):
     var samples_ns: List[Float64]
     var per_iteration: Bool
     var samples_seen: Int
+    var reference_ns: Float64
+    var reference_ratio: Float64
 
     def __init__(
         out self,
@@ -505,6 +678,10 @@ struct BenchResult(Copyable, Movable):
         self.samples_ns = List[Float64]()
         self.per_iteration = False
         self.samples_seen = 0
+        # Filled in by the suite once every probe of the run is in hand; a
+        # result built by hand carries no reference and reports none.
+        self.reference_ns = 0.0
+        self.reference_ratio = 1.0
 
     @staticmethod
     def sampled(
@@ -552,6 +729,27 @@ struct BenchResult(Copyable, Movable):
 
     def has_percentiles(self) -> Bool:
         return self.per_iteration and len(self.samples_ns) > 0
+
+    def headline_ns(self) -> Float64:
+        """The number a reader takes away: the p50 where there is one.
+
+        Everything that compares one measurement of a benchmark with another
+        one -- the end-of-run recheck, above all -- goes through here, so the
+        comparison is always against the number that was printed.
+        """
+        var p50 = self.p50_ns()
+        return p50.value() if p50 else self.mean_ns()
+
+    def contended(self, tolerance: Float64) -> Bool:
+        """True when the machine measurably slowed while this row was timed.
+
+        Args:
+            tolerance: Fractional slowdown of the reference kernel that counts
+                as interference; 0.05 is five percent.
+        """
+        return (
+            self.reference_ns > 0.0 and self.reference_ratio > 1.0 + tolerance
+        )
 
     # -- statistics ---------------------------------------------------------
 
@@ -739,6 +937,242 @@ def _sorted(values: List[Float64]) -> List[Float64]:
     return out^
 
 
+# ── Was this run worth believing? ───────────────────────────────────────────
+
+
+def _load_average() -> Float64:
+    """Runnable threads on this machine, averaged over the last minute.
+
+    The one question the harness cannot answer by timing itself: a run where
+    every measurement is uniformly inflated by a neighbouring process looks,
+    from the inside, exactly like a run of slower code. The operating system
+    knows, so ask it.
+
+    Negative when it cannot be determined, which is never treated as a
+    problem -- an unknown load says nothing, and inventing a number to warn
+    about would be worse than staying quiet.
+    """
+
+    comptime if CompilationTarget.is_macos():
+        # struct loadavg { fixpt_t ldavg[3]; long fscale; } -- three scaled
+        # averages and the scale they are in, 2048 in practice.
+        var key = _cstr("vm.loadavg")
+        var size = List[UInt64](length=1, fill=UInt64(32))
+        var buf = List[UInt32](length=8, fill=UInt32(0))
+        var rc = external_call["sysctlbyname", Int32](
+            key.unsafe_ptr(),
+            buf.unsafe_ptr(),
+            size.unsafe_ptr(),
+            Int(0),
+            Int(0),
+        )
+        if rc != 0 or Int(size[0]) < 20 or buf[4] == 0:
+            return -1.0
+        return Float64(Int(buf[0])) / Float64(Int(buf[4]))
+    elif CompilationTarget.is_linux():
+        return _proc_load_average()
+    return -1.0
+
+
+def _proc_load_average() -> Float64:
+    """The first field of `/proc/loadavg`, or -1 if it cannot be read.
+
+    A plain function rather than a branch of `_load_average`, so the parsing
+    is compiled -- and unit tested -- on every platform rather than only on
+    the one that can run it. `_proc_field` is a normal function for the same
+    reason.
+    """
+    try:
+        with open("/proc/loadavg", "r") as f:
+            var text = f.read()
+            var space = text.find(" ")
+            if space <= 0:
+                return -1.0
+            return Float64(String(text[byte=0:space]))
+    except:
+        return -1.0
+
+
+struct Stability(Copyable, Movable):
+    """Evidence about the run itself, gathered alongside the measurements.
+
+    A harness that reports only what it measured cannot tell the difference
+    between code that is slow and a machine that was busy, and neither can the
+    person reading the table. Three questions get answered here, all of them
+    about the run rather than the code, and each catching something the others
+    cannot.
+
+    * **Did the machine hold its speed?** `_reference_kernel` is timed either
+      side of every benchmark; it touches no memory and allocates nothing, so
+      the only things that move it belong to the machine. The baseline is the
+      median probe, not the fastest: a core coming out of idle can spend one
+      probe at a boost clock it will not hold, and treating that as the
+      standard would condemn every honest run that followed it. A result
+      whose slower bracketing probe is more than `tolerance` above the median
+      was measured while the machine was slow, and is named.
+    * **Does the first benchmark still measure the same?** It is re-timed at
+      the end of the run, with the iteration count it calibrated. That is the
+      direct test of what a harness owes its readers -- a number must not
+      depend on what else was selected, or on when in the run it was taken --
+      and it costs one repetition.
+    * **Was anything else running?** The two checks above compare the run
+      against itself, so a machine that was *uniformly* busy from start to
+      finish passes both while every number is inflated. That is exactly the
+      case that produced a 1.9x spread on identical code, so the load average
+      is read from the OS as well, and a machine with more runnable threads
+      than it has cores to spare is reported as what it is.
+
+    `ok` is all three, and it is what `--strict` exits on. Nothing here changes
+    a measurement; it changes whether one can be read as if it were
+    comparable.
+    """
+
+    var probes_ns: List[Float64]
+    var results_ns: List[Float64]
+    var rechecked: Bool
+    var recheck_name: String
+    var recheck_before_ns: Float64
+    var recheck_after_ns: Float64
+    var load: Float64
+    var load_budget: Float64
+    var tolerance: Float64
+
+    def __init__(
+        out self, tolerance: Float64 = 0.05, load_budget: Float64 = 0.0
+    ):
+        """A verdict that has learned nothing yet.
+
+        Args:
+            tolerance: Fractional disagreement treated as noise rather than
+                interference.
+            load_budget: Load average above which the machine counts as busy.
+                Zero disables the check.
+        """
+        self.probes_ns = List[Float64]()
+        self.results_ns = List[Float64]()
+        self.rechecked = False
+        self.recheck_name = String("")
+        self.recheck_before_ns = 0.0
+        self.recheck_after_ns = 0.0
+        self.load = -1.0
+        self.load_budget = load_budget
+        self.tolerance = tolerance
+
+    # -- what was observed --------------------------------------------------
+
+    def observe(mut self, reference_ns: Float64):
+        """Record one reference probe. Zero and below are dropped."""
+        if reference_ns > 0.0:
+            self.probes_ns.append(reference_ns)
+
+    def observe_result(mut self, reference_ns: Float64):
+        """Record the reference a single result ended up being judged by."""
+        self.results_ns.append(reference_ns)
+
+    def observe_load(mut self, load: Float64):
+        """Record the busiest load average seen around the run."""
+        if load > self.load:
+            self.load = load
+
+    def record_recheck(
+        mut self, var name: String, before_ns: Float64, after_ns: Float64
+    ):
+        """Record the first benchmark\'s headline, then and now."""
+        self.rechecked = True
+        self.recheck_name = name^
+        self.recheck_before_ns = before_ns
+        self.recheck_after_ns = after_ns
+
+    # -- what it means ------------------------------------------------------
+
+    def measured(self) -> Bool:
+        return len(self.probes_ns) > 0
+
+    def baseline_ns(self) -> Float64:
+        """The speed the machine held for most of the run."""
+        return _percentile(self.probes_ns, 0.5)
+
+    def best_ns(self) -> Float64:
+        return _min(self.probes_ns)
+
+    def worst_ns(self) -> Float64:
+        return _max(self.probes_ns)
+
+    def ratio(self, reference_ns: Float64) -> Float64:
+        """How slow the machine was at one probe, against the baseline."""
+        var base = self.baseline_ns()
+        if base <= 0.0 or reference_ns <= 0.0:
+            return 1.0
+        return reference_ns / base
+
+    def spread(self) -> Float64:
+        """Fraction the slowest probe of the run lost against the fastest."""
+        if not self.measured() or self.best_ns() <= 0.0:
+            return 0.0
+        return self.worst_ns() / self.best_ns() - 1.0
+
+    def slowest_ratio(self) -> Float64:
+        """The worst slowdown any result was measured through."""
+        var worst = 1.0
+        for i in range(len(self.results_ns)):
+            var r = self.ratio(self.results_ns[i])
+            if r > worst:
+                worst = r
+        return worst
+
+    def steady(self) -> Bool:
+        """True when no result was measured while the machine was slow."""
+        if not self.measured():
+            return True
+        return self.slowest_ratio() <= 1.0 + self.tolerance
+
+    def recheck_delta(self) -> Float64:
+        """Fraction the re-timed benchmark moved, in either direction."""
+        if not self.rechecked or self.recheck_before_ns <= 0.0:
+            return 0.0
+        var d = self.recheck_after_ns / self.recheck_before_ns - 1.0
+        return d if d >= 0.0 else -d
+
+    def reproducible(self) -> Bool:
+        """True when the re-timed benchmark agreed with its first timing."""
+        if not self.rechecked:
+            return True
+        return self.recheck_delta() <= self.tolerance
+
+    def quiet(self) -> Bool:
+        """True when the OS did not report other work competing for the CPU."""
+        if self.load < 0.0 or self.load_budget <= 0.0:
+            return True
+        return self.load <= self.load_budget
+
+    def ok(self) -> Bool:
+        """True when nothing observed makes these numbers untrustworthy."""
+        return self.steady() and self.reproducible() and self.quiet()
+
+    def as_json(self) -> String:
+        return String(
+            '{"ok": ', "true" if self.ok() else "false",
+            ', "tolerance": ', self.tolerance,
+            ', "reference_probes": ', len(self.probes_ns),
+            ', "reference_baseline_ns": ', self.baseline_ns(),
+            ', "reference_best_ns": ', self.best_ns(),
+            ', "reference_worst_ns": ', self.worst_ns(),
+            ', "reference_spread": ', self.spread(),
+            ', "slowest_ratio": ', self.slowest_ratio(),
+            ', "steady": ', "true" if self.steady() else "false",
+            ', "rechecked": ', "true" if self.rechecked else "false",
+            ', "recheck_name": "', self.recheck_name,
+            '", "recheck_before_ns": ', self.recheck_before_ns,
+            ', "recheck_after_ns": ', self.recheck_after_ns,
+            ', "recheck_delta": ', self.recheck_delta(),
+            ', "reproducible": ', "true" if self.reproducible() else "false",
+            ', "load_average": ', self.load,
+            ', "load_budget": ', self.load_budget,
+            ', "quiet": ', "true" if self.quiet() else "false",
+            "}",
+        )
+
+
 # ── Registration ────────────────────────────────────────────────────────────
 
 
@@ -774,6 +1208,10 @@ struct BenchSuite(Movable):
     var resolution_factor: Int
     var force_batched: Bool
     var timer_resolution_ns: Float64
+    var recheck: Bool
+    var strict: Bool
+    var stability_tolerance: Float64
+    var reference_reps: Int
 
     def __init__(
         out self,
@@ -784,6 +1222,8 @@ struct BenchSuite(Movable):
         max_iters: Int = 100_000_000,
         max_samples: Int = 20_000,
         resolution_factor: Int = 100,
+        recheck: Bool = True,
+        stability_tolerance: Float64 = 0.05,
     ):
         """Configure a suite.
 
@@ -797,6 +1237,12 @@ struct BenchSuite(Movable):
                 sampling entirely.
             resolution_factor: How many clock reads one iteration must cost
                 before it is worth timing on its own.
+            recheck: Re-time the first benchmark once at the end of the run
+                and report whether it still measures the same. Costs one
+                repetition.
+            stability_tolerance: Fractional disagreement -- between the
+                reference probes, or between a benchmark and its recheck --
+                treated as noise rather than interference.
         """
         self.benches = List[_Bench]()
         self.only = List[String]()
@@ -814,6 +1260,13 @@ struct BenchSuite(Movable):
         # Measured once, here, so every benchmark is judged against the same
         # number and the report can say what it was.
         self.timer_resolution_ns = _timer_resolution_ns()
+        self.recheck = recheck
+        self.strict = False
+        self.stability_tolerance = stability_tolerance
+        # Calibrated in `execute`, not here: constructing a suite is something
+        # the unit tests do dozens of times, and none of them wants to pay for
+        # a reference kernel it will never run.
+        self.reference_reps = 0
 
     # -- discovery ----------------------------------------------------------
 
@@ -843,6 +1296,8 @@ struct BenchSuite(Movable):
         max_iters: Int = 100_000_000,
         max_samples: Int = 20_000,
         resolution_factor: Int = 100,
+        recheck: Bool = True,
+        stability_tolerance: Float64 = 0.05,
     ) raises:
         """Discover every `bench_*` in the module, then parse argv and run.
 
@@ -857,6 +1312,10 @@ struct BenchSuite(Movable):
             max_samples: Ceiling on retained per-iteration samples.
             resolution_factor: How many clock reads one iteration must cost
                 before it is timed on its own.
+            recheck: Re-time the first benchmark at the end of the run and
+                report whether it still measures the same.
+            stability_tolerance: Fractional disagreement treated as noise
+                rather than interference.
         """
         var suite = Self(
             min_runtime_secs=min_runtime_secs,
@@ -865,6 +1324,8 @@ struct BenchSuite(Movable):
             max_iters=max_iters,
             max_samples=max_samples,
             resolution_factor=resolution_factor,
+            recheck=recheck,
+            stability_tolerance=stability_tolerance,
         )
         suite._discover[funcs]()
         suite.execute()
@@ -887,6 +1348,15 @@ struct BenchSuite(Movable):
                 # An escape hatch, mostly for reproducing a number recorded
                 # before per-iteration sampling existed.
                 self.force_batched = True
+                mode = String("")
+            elif arg == "--strict":
+                self.strict = True
+                mode = String("")
+            elif arg == "--no-recheck":
+                self.recheck = False
+                mode = String("")
+            elif arg == "--recheck":
+                self.recheck = True
                 mode = String("")
             elif arg == "--out":
                 if i + 1 >= len(args):
@@ -925,6 +1395,31 @@ struct BenchSuite(Movable):
                 return True
         return False
 
+    def _load_budget(self, host: Host) -> Float64:
+        """Load average this machine can carry before a timing is suspect.
+
+        Half the cores, and never less than two. A benchmark occupies one of
+        them and a developer machine idles with a thread or two of background
+        noise; past that the run is sharing the machine with something, and
+        which core the scheduler hands it -- performance or efficiency --
+        stops being predictable. Deliberately generous: the failure this
+        catches inflates a number by half or more, and a warning that fires on
+        a quiet machine would be ignored within a week.
+        """
+        var cores = Float64(host.physical_cores)
+        if cores <= 0.0:
+            return 0.0
+        var budget = cores * 0.5
+        return budget if budget > 2.0 else 2.0
+
+    def _index_of(self, name: String) -> Int:
+        """Where a benchmark sits in `benches`, or -1. Used by the recheck to
+        find the first benchmark again after the run."""
+        for i in range(len(self.benches)):
+            if self.benches[i].name == name:
+                return i
+        return -1
+
     def _selected(self, name: String) -> Bool:
         for s in self.skip:
             if s == name:
@@ -946,6 +1441,9 @@ struct BenchSuite(Movable):
             ', "resolution_factor": ', self.resolution_factor,
             ', "timer_resolution_ns": ', self.timer_resolution_ns,
             ', "force_batched": ', "true" if self.force_batched else "false",
+            ', "recheck": ', "true" if self.recheck else "false",
+            ', "stability_tolerance": ', self.stability_tolerance,
+            ', "reference_reps": ', self.reference_reps,
             "}",
         )
 
@@ -1032,10 +1530,47 @@ struct BenchSuite(Movable):
             if budget < 1:
                 budget = 1
 
-        var runs_ns = List[Float64](capacity=self.num_repetitions)
+        return self._repetitions(
+            b,
+            num_iters,
+            per_iteration,
+            budget,
+            self.num_repetitions,
+            metric^,
+            count,
+        )
+
+    def _repetitions(
+        self,
+        b: _Bench,
+        num_iters: Int,
+        per_iteration: Bool,
+        budget: Int,
+        num_repetitions: Int,
+        var metric: Optional[Metric],
+        count: Int,
+    ) raises -> BenchResult:
+        """Time an already-calibrated benchmark `num_repetitions` times.
+
+        Split out of `_run_one` so the end-of-run recheck can repeat exactly
+        the protocol that produced the printed number -- same iteration count,
+        same sampling mode, same reservoir budget -- and differ only in how
+        many repetitions it can afford. A recheck measured any other way would
+        be comparing two things and blaming the machine for the difference.
+
+        Args:
+            b: The registered benchmark.
+            num_iters: Calibrated iterations per repetition.
+            per_iteration: Whether to time each iteration on its own.
+            budget: Retained samples per repetition.
+            num_repetitions: How many timed repetitions to run.
+            metric: The throughput declaration read during calibration.
+            count: Work units per iteration.
+        """
+        var runs_ns = List[Float64](capacity=num_repetitions)
         var samples = List[Float64]()
         var seen = 0
-        for rep_index in range(self.num_repetitions):
+        for rep_index in range(num_repetitions):
             var rep = Benchmark(
                 num_iters,
                 sample_each=per_iteration,
@@ -1062,6 +1597,32 @@ struct BenchSuite(Movable):
             String(b.name), num_iters, runs_ns^, metric^, count
         )
 
+    def _recheck_one(self, b: _Bench, first: BenchResult) raises -> Float64:
+        """Re-time an already-measured benchmark, once, and return its
+        headline.
+
+        Args:
+            b: The registered benchmark, which must be the one `first`
+                describes.
+            first: What it measured the first time, for its iteration count
+                and sampling mode.
+        """
+        var budget = 0
+        if first.per_iteration and self.num_repetitions > 0:
+            budget = self.max_samples // self.num_repetitions
+            if budget < 1:
+                budget = 1
+        var again = self._repetitions(
+            b,
+            first.iters,
+            first.per_iteration,
+            budget,
+            1,
+            first.metric.copy(),
+            first.count,
+        )
+        return again.headline_ns()
+
     def execute(mut self) raises:
         """Parse argv, run the selected benchmarks, and report."""
         self._parse_args()
@@ -1073,16 +1634,61 @@ struct BenchSuite(Movable):
             print(_json_string_array(names))
             return
 
+        var host = Host.detect()
+
+        # One reference measurement per boundary: before the first benchmark,
+        # between each pair, and after the last. A benchmark is bracketed by
+        # two of them, and the slower of the two is what its row is judged by,
+        # so interference has to miss both windows to go unreported.
+        self.reference_reps = _calibrate_reference()
+        var stability = Stability(
+            tolerance=self.stability_tolerance,
+            load_budget=self._load_budget(host),
+        )
+        stability.observe_load(_load_average())
+        var references = List[Float64]()
+
         var results = List[BenchResult]()
         for b in self.benches:
             if not self._selected(b.name):
                 continue
             if not self.json:
                 print("running", b.name, "...")
+            var before = _reference_ns(self.reference_reps)
+            references.append(before)
+            stability.observe(before)
             results.append(self._run_one(b))
+        var after_last = _reference_ns(self.reference_reps)
+        references.append(after_last)
+        stability.observe(after_last)
 
-        var host = Host.detect()
-        var payload = _json_report(host, self._config_json(), results)
+        for i in range(len(results)):
+            var bracketing = references[i]
+            if references[i + 1] > bracketing:
+                bracketing = references[i + 1]
+            results[i].reference_ns = bracketing
+            results[i].reference_ratio = stability.ratio(bracketing)
+            stability.observe_result(bracketing)
+
+        # The direct test of the property this harness owes its readers: the
+        # first benchmark, measured again after everything else has run, on the
+        # same iteration count. If the number moved, it depended on something
+        # other than the code -- what else was selected, or when it ran -- and
+        # saying so is worth one repetition.
+        if self.recheck and len(results) > 0:
+            var idx = self._index_of(results[0].name)
+            if idx >= 0:
+                if not self.json:
+                    print("re-checking", results[0].name, "...")
+                var again = self._recheck_one(self.benches[idx], results[0])
+                stability.record_recheck(
+                    String(results[0].name), results[0].headline_ns(), again
+                )
+
+        stability.observe_load(_load_average())
+        var payload = _json_report(
+            host, self._config_json(), results, stability
+        )
         if self.json:
             print(payload)
         else:
@@ -1097,12 +1703,18 @@ struct BenchSuite(Movable):
                 "per iteration",
             )
             print(_table(results))
+            print(_stability_report(stability, results))
         if self.out_path.byte_length() > 0:
             with open(self.out_path, "w") as f:
                 f.write(payload)
                 f.write("\n")
             if not self.json:
                 print("wrote", self.out_path)
+
+        # `--strict` is for whatever publishes these numbers: a run the harness
+        # could not vouch for should fail the job rather than reach a README.
+        if self.strict and not stability.ok():
+            exit(1)
 
 
 # ── Output ──────────────────────────────────────────────────────────────────
@@ -1118,10 +1730,117 @@ def _json_string_array(names: List[String]) -> String:
     return out^
 
 
-def _json_report(
-    host: Host, config: String, results: List[BenchResult]
+def _stability_report(
+    stability: Stability, results: List[BenchResult]
 ) -> String:
-    """The full report: what it ran on, how it was run, and what it measured.
+    """One line when the run holds up, and a paragraph when it does not.
+
+    The line is not decoration. A table of timings with nothing said about the
+    machine invites the reader to assume the machine was quiet, and on a shared
+    machine that assumption is wrong often enough to have produced a 1.9x
+    spread on identical code. Stating the evidence -- the reference kernel
+    varied by this much, the first benchmark still measures the same -- is what
+    makes the numbers quotable; stating its absence is what stops them being
+    quoted by mistake.
+    """
+    if not stability.measured() and not stability.rechecked:
+        return String("machine: not checked")
+
+    if stability.ok():
+        var out = String("machine: steady")
+        if stability.measured():
+            out += String(
+                " — reference work within ",
+                _round(stability.spread() * 100.0, 1),
+                "% across the run",
+            )
+        if stability.load >= 0.0:
+            out += String("; load average ", _round(stability.load, 2))
+        if stability.rechecked:
+            out += String(
+                "; ",
+                stability.recheck_name,
+                " re-timed within ",
+                _round(stability.recheck_delta() * 100.0, 1),
+                "%",
+            )
+        return out^
+
+    var out = String("machine: NOT STEADY — these numbers are not comparable")
+    if not stability.quiet():
+        out += String(
+            "\n  WARNING: the load average was ",
+            _round(stability.load, 2),
+            " on a machine budgeted for ",
+            _round(stability.load_budget, 2),
+            (
+                ". Something else was running, and everything below may be"
+                " inflated by it -- uniformly, which is why the timings"
+                " themselves look consistent."
+            ),
+        )
+    if not stability.steady():
+        out += String(
+            "\n  WARNING: reference work ran ",
+            _round((stability.slowest_ratio() - 1.0) * 100.0, 1),
+            "% slower for part of this run than for the rest of it (",
+            _format_ns(stability.baseline_ns()),
+            " typical, ",
+            _format_ns(stability.worst_ns()),
+            (
+                " at worst). The rows measured through that are inflated"
+                " against the others."
+            ),
+        )
+        var named = String("")
+        for i in range(len(results)):
+            ref r = results[i]
+            if not r.contended(stability.tolerance):
+                continue
+            if named.byte_length() > 0:
+                named += ", "
+            named += String(
+                r.name,
+                " (+",
+                _round((r.reference_ratio - 1.0) * 100.0, 1),
+                "%)",
+            )
+        if named.byte_length() > 0:
+            out += String("\n  measured while the machine was slow: ", named)
+    if not stability.reproducible():
+        out += String(
+            "\n  WARNING: ",
+            stability.recheck_name,
+            " re-timed at the end of the run came out ",
+            _round(stability.recheck_delta() * 100.0, 1),
+            "% away from its first timing (",
+            _format_ns(stability.recheck_before_ns),
+            " then, ",
+            _format_ns(stability.recheck_after_ns),
+            (
+                " now). This run is not reproducible against itself; do not"
+                " publish it."
+            ),
+        )
+    out += String(
+        "\n  Re-run on an idle machine. `--strict` turns this into a"
+        " non-zero exit."
+    )
+    return out^
+
+
+def _json_report(
+    host: Host,
+    config: String,
+    results: List[BenchResult],
+    stability: Stability,
+) -> String:
+    """What it ran on, how it was run, whether the run holds up, and what it
+    measured.
+
+    `stability` is the fourth part and the newest: a report that cannot say
+    whether the machine was steady while it measured is a report whose numbers
+    cannot be compared with anyone else's, or with their own history.
 
     Still no commit or timestamp -- the binary has no business shelling out to
     git, and whatever saves these adds them. The machine is different: a
@@ -1131,6 +1850,7 @@ def _json_report(
     return String(
         '{"host": ', host.as_json(),
         ', "config": ', config,
+        ', "stability": ', stability.as_json(),
         ', "results": ', _json_results(results),
         "}",
     )
@@ -1169,6 +1889,9 @@ def _json_results(results: List[BenchResult]) -> String:
             out += ", " + '"p99_ns": ' + String(r.p99_ns().value())
             out += ", " + '"samples": ' + String(r.num_samples())
             out += ", " + '"samples_seen": ' + String(r.samples_seen)
+        if r.reference_ns > 0.0:
+            out += ", " + '"reference_ns": ' + String(r.reference_ns)
+            out += ", " + '"reference_ratio": ' + String(r.reference_ratio)
         out += ", " + '"runs_ns": ['
         for j in range(len(r.runs_ns)):
             if j > 0:

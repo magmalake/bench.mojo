@@ -6,21 +6,31 @@ trustworthy. The timing loop is checked for shape rather than duration: a test
 that asserts on wall-clock is a test that fails on a busy CI runner.
 """
 
-from std.testing import TestSuite, assert_equal, assert_true, assert_almost_equal
+from std.testing import (
+    TestSuite,
+    assert_equal,
+    assert_true,
+    assert_almost_equal,
+)
 
-from bench import Benchmark, BenchResult, BenchSuite, Metric, keep
+from bench import Benchmark, BenchResult, BenchSuite, Metric, Stability, keep
 from bench.suite import (
     Host,
+    _calibrate_reference,
     _format_ns,
     _json_report,
     _json_results,
+    _load_average,
+    _proc_load_average,
     _mean,
     _percentile,
     _rate_str,
+    _reference_ns,
     _sampling_cell,
     _scaled_rate,
     _round2,
     _sorted,
+    _stability_report,
     _table,
     _timer_resolution_ns,
 )
@@ -255,9 +265,15 @@ def test_metric_units() raises:
 def test_scaled_rate_picks_a_readable_prefix() raises:
     # Argument is in giga-per-second, as `BenchResult.rate()` returns.
     assert_equal(_scaled_rate(28.47, String("B/s")), String("28.47 GB/s"))
-    assert_equal(_scaled_rate(0.873e-3, String("Elems/s")), String("873.00 KElems/s"))
-    assert_equal(_scaled_rate(0.0189, String("Elems/s")), String("18.90 MElems/s"))
-    assert_equal(_scaled_rate(0.0000005, String("Elems/s")), String("500.00 Elems/s"))
+    assert_equal(
+        _scaled_rate(0.873e-3, String("Elems/s")), String("873.00 KElems/s")
+    )
+    assert_equal(
+        _scaled_rate(0.0189, String("Elems/s")), String("18.90 MElems/s")
+    )
+    assert_equal(
+        _scaled_rate(0.0000005, String("Elems/s")), String("500.00 Elems/s")
+    )
 
 
 # ── the Benchmark handle ────────────────────────────────────────────────────
@@ -412,9 +428,12 @@ def test_host_reports_a_usable_machine() raises:
 def test_report_wraps_host_config_and_results() raises:
     var results = List[BenchResult]()
     results.append(_result([1.0]))
-    var out = _json_report(Host.detect(), String('{"k": 1}'), results)
+    var out = _json_report(
+        Host.detect(), String('{"k": 1}'), results, Stability()
+    )
     assert_true(out.startswith('{"host": {'))
     assert_true('"config": {"k": 1}' in out)
+    assert_true('"stability": {"ok": true' in out)
     assert_true('"results": [' in out)
     assert_true(out.endswith("}"))
 
@@ -536,6 +555,234 @@ def test_config_json_records_how_the_decision_was_made() raises:
     assert_true('"resolution_factor": 100' in cfg)
     assert_true('"timer_resolution_ns": ' in cfg)
     assert_true('"force_batched": false' in cfg)
+    assert_true('"recheck": true' in cfg)
+    assert_true('"stability_tolerance": ' in cfg)
+
+
+# ── was the run worth believing ─────────────────────────────────────────────
+#
+# The verdict is asserted on values fed in by hand, for the same reason the
+# statistics are: a test that needs the machine to actually be busy is a test
+# that passes for the wrong reason.
+
+
+def test_a_run_with_no_evidence_is_not_called_unsteady() raises:
+    var s = Stability()
+    assert_true(not s.measured())
+    assert_true(s.steady())
+    assert_true(s.reproducible())
+    assert_true(s.quiet())
+    assert_true(s.ok())
+    assert_equal(s.spread(), 0.0)
+
+
+def test_a_result_measured_through_a_slow_probe_is_not_steady() raises:
+    var s = Stability(tolerance=0.05)
+    s.observe(1_000_000.0)
+    s.observe(1_500_000.0)
+    s.observe(1_000_000.0)
+    assert_equal(s.baseline_ns(), 1_000_000.0)  # the median, not the fastest
+    assert_almost_equal(s.spread(), 0.5)
+    s.observe_result(1_500_000.0)
+    assert_almost_equal(s.slowest_ratio(), 1.5)
+    assert_true(not s.steady())
+    assert_true(not s.ok())
+
+
+def test_one_fast_probe_does_not_condemn_the_rest_of_the_run() raises:
+    """A core coming out of idle spends a moment above the clock it can hold.
+    That is the machine being fast, not the run being wrong, and taking the
+    fastest probe as the standard would fail every honest run after it."""
+    var s = Stability(tolerance=0.05)
+    s.observe(700_000.0)  # a boost burst at process start
+    s.observe(1_000_000.0)
+    s.observe(1_010_000.0)
+    s.observe_result(1_000_000.0)
+    s.observe_result(1_010_000.0)
+    assert_equal(s.baseline_ns(), 1_000_000.0)
+    assert_true(s.steady())
+    assert_true(s.ok())
+
+
+def test_a_probe_within_tolerance_leaves_the_run_steady() raises:
+    var s = Stability(tolerance=0.05)
+    s.observe(1_000_000.0)
+    s.observe(1_020_000.0)
+    s.observe_result(1_020_000.0)
+    assert_true(s.slowest_ratio() < 1.05)
+    assert_true(s.steady())
+    assert_true(s.ok())
+
+
+def test_a_zero_probe_is_ignored_rather_than_taken_as_the_best() raises:
+    var s = Stability()
+    s.observe(0.0)
+    assert_true(not s.measured())
+    s.observe(1_000_000.0)
+    assert_equal(s.best_ns(), 1_000_000.0)
+
+
+def test_a_busy_machine_is_reported_even_when_it_was_busy_throughout() raises:
+    """The check the other two cannot make: uniform contention leaves the run
+    perfectly self-consistent and every number in it inflated."""
+    var s = Stability(tolerance=0.05, load_budget=5.0)
+    s.observe(1_000_000.0)
+    s.observe(1_010_000.0)
+    s.observe_result(1_010_000.0)
+    s.observe_load(9.4)
+    assert_true(s.steady())
+    assert_true(s.reproducible())
+    assert_true(not s.quiet())
+    assert_true(not s.ok())
+
+
+def test_an_unknown_or_unbudgeted_load_is_never_held_against_a_run() raises:
+    var unknown = Stability(tolerance=0.05, load_budget=5.0)
+    unknown.observe_load(-1.0)
+    assert_true(unknown.quiet())
+
+    var unbudgeted = Stability(tolerance=0.05, load_budget=0.0)
+    unbudgeted.observe_load(99.0)
+    assert_true(unbudgeted.quiet())
+
+
+def test_recheck_delta_is_the_same_size_in_either_direction() raises:
+    var slower = Stability()
+    slower.record_recheck(String("b"), 100.0, 150.0)
+    assert_almost_equal(slower.recheck_delta(), 0.5)
+    assert_true(not slower.reproducible())
+
+    var faster = Stability()
+    faster.record_recheck(String("b"), 100.0, 50.0)
+    assert_almost_equal(faster.recheck_delta(), 0.5)
+    assert_true(not faster.reproducible())
+
+
+def test_a_recheck_that_agrees_leaves_the_run_reproducible() raises:
+    var s = Stability(tolerance=0.05)
+    s.observe(1_000_000.0)
+    s.record_recheck(String("b"), 100.0, 102.0)
+    assert_true(s.reproducible())
+    assert_true(s.ok())
+
+
+def test_stability_json_carries_the_verdict_and_its_evidence() raises:
+    var s = Stability(tolerance=0.05)
+    s.observe(1_000_000.0)
+    s.observe(2_000_000.0)
+    s.observe_result(2_000_000.0)
+    s.record_recheck(String("bench_x"), 100.0, 101.0)
+    var out = s.as_json()
+    assert_true('"ok": false' in out)
+    assert_true('"steady": false' in out)
+    assert_true('"reproducible": true' in out)
+    assert_true('"reference_probes": 2' in out)
+    assert_true('"reference_spread": 1.0' in out)
+    assert_true('"recheck_name": "bench_x"' in out)
+
+
+def test_a_result_is_contended_only_past_the_tolerance() raises:
+    var r = _result([1.0])
+    assert_true(not r.contended(0.05))  # no reference at all
+    r.reference_ns = 1_200_000.0
+    r.reference_ratio = 1.2
+    assert_true(r.contended(0.05))
+    assert_true(not r.contended(0.5))
+
+
+def test_headline_is_the_p50_when_there_is_one_and_the_mean_otherwise() raises:
+    var sampled = _sampled([10.0, 20.0, 30.0])
+    assert_equal(sampled.headline_ns(), 20.0)
+    var batched = _result([10.0, 20.0, 30.0])
+    assert_equal(batched.headline_ns(), 20.0)
+    var skewed = _result([10.0, 10.0, 100.0])
+    assert_equal(skewed.headline_ns(), 40.0)  # the mean, not the median
+
+
+def test_a_steady_run_reports_one_line_and_no_warning() raises:
+    var s = Stability(tolerance=0.05)
+    s.observe(1_000_000.0)
+    s.observe(1_010_000.0)
+    s.record_recheck(String("bench_x"), 100.0, 101.0)
+    var out = _stability_report(s, List[BenchResult]())
+    assert_true(out.startswith("machine: steady"))
+    assert_true("WARNING" not in out)
+
+
+def test_an_unsteady_run_warns_and_names_the_rows_it_can() raises:
+    var s = Stability(tolerance=0.05)
+    s.observe(1_000_000.0)
+    s.observe(1_600_000.0)
+    s.observe_result(1_600_000.0)
+    var results = List[BenchResult]()
+    results.append(_result([1.0]))
+    results[0].name = String("bench_slow")
+    results[0].reference_ns = 1_600_000.0
+    results[0].reference_ratio = 1.6
+    var out = _stability_report(s, results)
+    assert_true("NOT STEADY" in out)
+    assert_true("WARNING" in out)
+    assert_true("bench_slow" in out)
+
+
+def test_a_busy_machine_says_so_under_the_table() raises:
+    var s = Stability(tolerance=0.05, load_budget=5.0)
+    s.observe(1_000_000.0)
+    s.observe(1_010_000.0)
+    s.observe_result(1_010_000.0)
+    s.observe_load(9.4)
+    var out = _stability_report(s, List[BenchResult]())
+    assert_true("NOT STEADY" in out)
+    assert_true("load average was 9.40" in out)
+
+
+def test_an_irreproducible_run_says_so_even_on_a_steady_machine() raises:
+    var s = Stability(tolerance=0.05)
+    s.observe(1_000_000.0)
+    s.record_recheck(String("bench_x"), 100.0, 150.0)
+    var out = _stability_report(s, List[BenchResult]())
+    assert_true("NOT STEADY" in out)
+    assert_true("not reproducible" in out)
+    assert_true("bench_x" in out)
+
+
+def test_the_load_average_is_a_real_number_or_an_admission() raises:
+    """Either the OS answered, in which case the answer is not negative, or it
+    did not, in which case the harness says -1 rather than guessing."""
+    var load = _load_average()
+    assert_true(load >= 0.0 or load == -1.0)
+
+
+def test_reading_a_load_average_that_is_not_there_is_not_a_crash() raises:
+    """On macOS there is no /proc/loadavg, so this exercises the failure path
+    the Linux branch depends on: no file, no number, no exception escaping."""
+    var load = _proc_load_average()
+    assert_true(load >= 0.0 or load == -1.0)
+
+
+def test_the_load_budget_scales_with_the_machine_and_has_a_floor() raises:
+    var suite = BenchSuite()
+    var big = Host(
+        String("cpu"), String("linux"), String("x86_64"), 64, 128, 64, 0, False
+    )
+    assert_equal(suite._load_budget(big), 32.0)
+    var small = Host(
+        String("cpu"), String("linux"), String("x86_64"), 2, 2, 2, 0, False
+    )
+    assert_equal(suite._load_budget(small), 2.0)
+    var unknown = Host(String(""), String(""), String(""), 0, 0, 0, 0, False)
+    assert_equal(suite._load_budget(unknown), 0.0)  # no cores, no opinion
+
+
+def test_the_reference_kernel_calibrates_and_measures_something() raises:
+    """Shape, not duration: the value is a wall-clock number, so the only
+    honest assertions are that it exists and is positive."""
+    var reps = _calibrate_reference()
+    assert_true(reps >= 1)
+    var a = _reference_ns(reps)
+    var b = _reference_ns(reps)
+    assert_true(a > 0.0)
+    assert_true(b > 0.0)
 
 
 # ── discovery ───────────────────────────────────────────────────────────────
@@ -678,6 +925,28 @@ def test_run_one_batches_when_an_iteration_is_too_cheap_to_time() raises:
     assert_equal(len(result.samples_ns), 0)
     assert_true(not result.p90_ns())
     assert_equal(len(result.runs_ns), 3)
+
+
+def test_recheck_repeats_the_first_benchmarks_protocol() raises:
+    """The recheck must measure the same thing the printed number measured:
+    same iteration count, same sampling mode. It differs only in running one
+    repetition instead of several."""
+    var suite = BenchSuite(
+        min_runtime_secs=0.005,
+        num_warmup_iters=0,
+        num_repetitions=3,
+        max_iters=200,
+        max_samples=60,
+    )
+    suite.timer_resolution_ns = 1.0
+    suite.resolution_factor = 1
+    suite._discover[(_helper_not_a_bench, bench_measurable)]()
+    var first = suite._run_one(suite.benches[0])
+    var again = suite._recheck_one(suite.benches[0], first)
+    assert_true(again > 0.0)
+    # Both are per-iteration nanoseconds for the same body, so they are
+    # comparable at all -- which is the only thing a wall-clock test may say.
+    assert_true(first.headline_ns() > 0.0)
 
 
 def test_calibration_respects_max_iters() raises:
