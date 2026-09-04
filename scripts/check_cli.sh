@@ -101,4 +101,46 @@ batched_json="$("$bin" --only bench_sum --batched --json)"
 [[ "$batched_json" != *"p90_ns"* ]] || fail "--batched json carries an unmeasured p90"
 [[ "$batched_json" == *'"force_batched": true'* ]] || fail "--batched json config wrong"
 
+# Every run says whether the machine held still for it. Which verdict it
+# reaches depends on the machine, so this asserts that a verdict is reported
+# and that its evidence is present — never that a shared CI runner was quiet.
+[[ "$table" == *"machine: "* ]] || fail "table says nothing about the machine: $table"
+
+stability_json="$("$bin" --only bench_sum --json)"
+cat > "$work/check_stability.py" <<'PYEOF'
+import json, sys
+
+d = json.load(sys.stdin)
+s = d["stability"]
+assert isinstance(s["ok"], bool), s
+assert s["reference_probes"] >= 2, s          # one either side of the benchmark
+assert s["reference_baseline_ns"] > 0, s
+assert s["reference_worst_ns"] >= s["reference_best_ns"] > 0, s
+assert s["slowest_ratio"] >= 1.0, s
+assert s["rechecked"] is True, s
+assert s["recheck_name"] == "bench_sum", s
+assert s["recheck_before_ns"] > 0 and s["recheck_after_ns"] > 0, s
+assert s["ok"] == (s["steady"] and s["reproducible"] and s["quiet"]), s
+
+r = d["results"][0]
+assert r["reference_ns"] > 0, r
+assert r["reference_ratio"] > 0, r
+assert d["config"]["reference_reps"] > 0, d["config"]
+print("  machine:", "steady" if s["ok"] else "not steady",
+      "| load", s["load_average"], "of", s["load_budget"],
+      "| recheck %.2f%%" % (s["recheck_delta"] * 100))
+PYEOF
+python3 "$work/check_stability.py" <<<"$stability_json" \
+  || fail "the stability verdict is not the expected shape"
+
+# --no-recheck skips the extra repetition and says that it did.
+norecheck="$("$bin" --only bench_sum --no-recheck --json)"
+[[ "$norecheck" == *'"rechecked": false'* ]] || fail "--no-recheck still rechecked"
+[[ "$norecheck" == *'"recheck": false'* ]] || fail "--no-recheck not in config"
+
+# --strict is accepted and prints the same report. Its exit code is *not*
+# asserted: it depends on how busy the machine is, and a CI runner is not
+# quiet — which is the whole point of the flag.
+"$bin" --only bench_sum --strict >/dev/null 2>&1 || true
+
 echo "check_cli: ok"
