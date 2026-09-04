@@ -164,7 +164,7 @@ def test_json_omits_throughput_when_undeclared() raises:
 
 
 def test_host_reports_a_usable_machine() raises:
-    """cpu and memory may be unknown on an unfamiliar platform; the rest comes
+    """CPU and memory may be unknown on an unfamiliar platform; the rest comes
     from std.sys and always resolves."""
     var h = Host.detect()
     assert_true(h.os == String("macos") or h.os == String("linux"))
