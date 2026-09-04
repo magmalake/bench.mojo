@@ -58,11 +58,11 @@ Whether the run is worth believing at all
 Everything above measures the code. None of it can tell whether the *machine*
 was the same machine for the whole run, and on a shared one it frequently is
 not: another process takes a performance core, the scheduler drops the thread
-onto an efficiency core, the package throttles. A benchmark that is 32 ms on
-an idle machine reports 47 ms against a handful of competing threads and 62 ms
-against a dozen -- identical code, identical fixture, identical binary. Nothing
-in the timings says which of those a table is showing, and the longer a run
-takes, the more likely it is to have caught someone else's build.
+onto an efficiency core, the package throttles. Measured here, one benchmark
+that is 31 ms on an idle machine reports 51 ms against eight competing threads
+and 89 ms against sixteen -- identical code, identical fixture, identical
+binary. Nothing in the timings says which of those a table is showing, and the
+longer a run takes, the more likely it is to have caught someone else's build.
 
 So the harness measures the machine as well, and `Stability` is the verdict:
 
@@ -1017,10 +1017,19 @@ struct Stability(Copyable, Movable):
       and it costs one repetition.
     * **Was anything else running?** The two checks above compare the run
       against itself, so a machine that was *uniformly* busy from start to
-      finish passes both while every number is inflated. That is exactly the
-      case that produced a 1.9x spread on identical code, so the load average
+      finish passes both while every number is inflated, so the load average
       is read from the OS as well, and a machine with more runnable threads
       than it has cores to spare is reported as what it is.
+
+    None of this rescues a suite run under `mojo run`. JIT-executing several
+    benchmarks in one process inflated an allocation-heavy one by 1.9x --
+    62 ms against 33 ms for the same benchmark alone -- while the same program
+    built ahead of time measured 32.8 ms in the suite against 32.1 ms alone.
+    That spread was first blamed on benchmark ordering and then on a busy
+    machine; it was neither, and both diagnoses survived a while because the
+    isolated and suite readings were taken through different execution paths.
+    Build the benchmark and run the binary. `Stability` reports the machine,
+    not the toolchain.
 
     `ok` is all three, and it is what `--strict` exits on. Nothing here changes
     a measurement; it changes whether one can be read as if it were
