@@ -33,8 +33,23 @@ import json, sys
 
 d = json.load(sys.stdin)
 assert len(d["results"]) == 1, d
-assert len(d["results"][0]["runs_ns"]) == 3, d
+r = d["results"][0]
+assert len(r["runs_ns"]) == 3, d
 assert d["config"]["num_repetitions"] == 3, d
+
+# The clock's resolution is measured, not assumed, and the report says what it
+# came out as and what threshold it produced.
+assert d["config"]["timer_resolution_ns"] > 0, d
+assert d["config"]["resolution_factor"] > 0, d
+assert d["config"]["force_batched"] is False, d
+
+# `tests/example_bench.mojo` is sized so one iteration clears that threshold,
+# so this run must have measured a real per-iteration distribution.
+assert r["sampling"] == "per-iteration", r
+assert r["samples"] > 1, r
+assert r["samples_seen"] >= r["samples"], r
+assert r["min_ns"] <= r["p50_ns"] <= r["p90_ns"] <= r["p99_ns"] <= r["max_ns"], r
+assert r["p50_ns"] == r["median_ns"], r
 
 h = d["host"]
 # cpu and memory can legitimately be unknown on an unfamiliar platform; the
@@ -70,5 +85,20 @@ table="$("$bin" --only bench_sum)"
 # Not "GElems/s": the table scales the prefix to the number, so a slower
 # machine legitimately reports MElems/s or KElems/s here.
 [[ "$table" == *"Elems/s"* ]] || fail "table missing rate column: $table"
+[[ "$table" == *"p50"* && "$table" == *"p90"* ]] || fail "table missing percentiles: $table"
+[[ "$table" == *"per-iter"* ]] || fail "table does not name its sampling mode: $table"
+[[ "$table" != *"n/a"* ]] || fail "table has n/a on a per-iteration row: $table"
+
+# --batched gives up the distribution, and must say so rather than computing a
+# percentile over three repetition means.
+batched="$("$bin" --only bench_sum --batched)"
+[[ "$batched" == *"batched"* ]] || fail "--batched table not labelled: $batched"
+[[ "$batched" == *"n/a"* ]] || fail "--batched printed a percentile it did not measure: $batched"
+
+batched_json="$("$bin" --only bench_sum --batched --json)"
+[[ "$batched_json" == *'"sampling": "batched"'* ]] || fail "--batched json not labelled"
+[[ "$batched_json" != *"p50_ns"* ]] || fail "--batched json carries an unmeasured p50"
+[[ "$batched_json" != *"p90_ns"* ]] || fail "--batched json carries an unmeasured p90"
+[[ "$batched_json" == *'"force_batched": true'* ]] || fail "--batched json config wrong"
 
 echo "check_cli: ok"
