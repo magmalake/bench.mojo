@@ -18,6 +18,40 @@ The soft one: `Bench.dump_report` gives a mean and nothing else. Reports need
 the spread, so `_run_one` keeps every per-repetition timing and the JSON
 carries them alongside the summary statistics.
 
+Two sampling modes, and why a row says which one it used
+--------------------------------------------------------
+
+`runs_ns` holds one number per *repetition*, and a repetition is already the
+mean of `num_iters` iterations. A default run produces three or five of them.
+Percentiles over that vector would be percentiles over a handful of averages:
+the averaging inside a repetition is exactly what destroys the tail a p90 is
+asked to show, and printing one anyway would look rigorous while meaning
+nothing. So the harness measures the distribution instead of inferring it.
+
+* **per-iteration** -- each call of the timed closure gets its own
+  `perf_counter_ns` pair and the sample is kept. `p50`, `p90` and `p99` are
+  real order statistics over real iterations.
+* **batched** -- one timer pair wraps the whole loop, as before. Only
+  `runs_ns` exists, and the percentile columns read `n/a` in the table and are
+  **absent** from the JSON. `mean_ns`, `min_ns`, `max_ns`, `median_ns` and
+  `stddev_ns` remain, over the repetition means, as they always were.
+
+The rule for choosing: `_timer_resolution_ns()` measures, at suite
+construction, the smallest interval this machine's clock can actually
+distinguish -- nothing is hard-coded, and it is the *tick*, not the call cost.
+Those differ by two orders of magnitude on macOS/arm64: a `perf_counter_ns`
+read costs about 13 ns and the clock advances in 1000 ns steps. Per-iteration
+timing is used only when one iteration costs at least `resolution_factor`
+times the tick (100 by default), holding quantisation under 1% of every
+sample. Below that, batching is the only way to measure the thing at all, and
+the harness says so rather than inventing a distribution.
+
+Every row and every JSON result carries its mode, so no number is ambiguous
+about what it was computed over. Retained samples are capped at `max_samples`
+(20,000 by default) by reservoir sampling; when the cap bites, the count of
+kept-versus-seen samples is printed too, because a percentile over a subsample
+is honest only if it is labelled as one.
+
 Writing a benchmark::
 
     from harness import Benchmark, BenchSuite, Metric, keep
@@ -48,6 +82,7 @@ The resulting binary is its own CLI:
     --skip A B ...    run everything but these
     --json            print results as JSON instead of a table
     --out PATH        also write the JSON to PATH
+    --batched         force batched timing, giving up the percentiles
 """
 
 from std.benchmark.compiler import keep
@@ -250,6 +285,68 @@ struct Host(Copyable, Movable):
         )
 
 
+# ── The clock ───────────────────────────────────────────────────────────────
+
+
+def _timer_resolution_ns() -> Float64:
+    """The smallest interval `perf_counter_ns()` can honestly report here.
+
+    Measured rather than assumed, and it is deliberately *not* the call cost.
+    On macOS/arm64 a read costs about 13 ns while the clock advances in 1000 ns
+    steps -- a single sample is quantised to the microsecond however cheap the
+    read was. Treating the call cost as the limit would have enabled
+    per-iteration timing at around 1.5 us an iteration, where every sample
+    carries up to 64% quantisation error: a rigorous-looking number that
+    describes the clock rather than the code, which is the exact failure this
+    mode exists to avoid.
+
+    So both are measured and the larger wins. The amortised cost of a call in a
+    tight loop is what a read costs; the tick, found by spinning until the
+    value changes, is what a read can *distinguish*. The spin is bounded --
+    a clock that never advances gets the call cost and nothing worse than a
+    conservative threshold.
+    """
+    comptime N = 512
+
+    var t0 = perf_counter_ns()
+    for _ in range(N):
+        keep(perf_counter_ns())
+    var call_ns = Float64(perf_counter_ns() - t0) / Float64(N)
+
+    comptime TICKS = 32
+    comptime SPIN_LIMIT = 1_000_000
+    var ticks = List[Float64](capacity=TICKS)
+    for _ in range(TICKS):
+        var start = perf_counter_ns()
+        var now = start
+        var spins = 0
+        while now == start and spins < SPIN_LIMIT:
+            now = perf_counter_ns()
+            spins += 1
+        if now != start:
+            ticks.append(Float64(now - start))
+    var tick_ns = _percentile(ticks, 0.5)
+
+    var floor = call_ns if call_ns > tick_ns else tick_ns
+    # A clock that reports nothing about itself is not a licence to treat
+    # per-iteration timing as free; one nanosecond is the smallest honest
+    # floor.
+    return floor if floor > 0.0 else 1.0
+
+
+def _next_rand(mut state: UInt64) -> UInt64:
+    """xorshift64*, for reservoir sampling.
+
+    Seeded deterministically: what is wanted is a draw uniform over iteration
+    index, not unpredictability, and a fixed seed means two runs of the same
+    binary subsample the same positions.
+    """
+    state ^= state >> 12
+    state ^= state << 25
+    state ^= state >> 27
+    return state * UInt64(0x2545F4914F6CDD1D)
+
+
 # ── The value handed to each benchmark ──────────────────────────────────────
 
 
@@ -260,18 +357,49 @@ struct Benchmark:
     to read its throughput declaration, then to calibrate, then once per
     repetition -- so the body must be cheap to re-enter. Building the input
     outside `iter` is the point: that work is never timed.
+
+    `sample_each` switches `iter` from one timer pair around the loop to one
+    per iteration, which is what makes a real p90 possible. The suite decides;
+    a benchmark body never has to know which mode it is running under.
     """
 
     var num_iters: Int
     var elapsed: Int
     var metric: Optional[Metric]
     var count: Int
+    var sample_each: Bool
+    var max_samples: Int
+    var samples_ns: List[Float64]
+    var samples_seen: Int
+    var _rng: UInt64
 
-    def __init__(out self, num_iters: Int):
+    def __init__(
+        out self,
+        num_iters: Int,
+        *,
+        sample_each: Bool = False,
+        max_samples: Int = 0,
+        seed: UInt64 = 0x9E3779B97F4A7C15,
+    ):
+        """Create the handle the suite passes to one benchmark call.
+
+        Args:
+            num_iters: How many times `iter` runs the timed closure.
+            sample_each: Time every iteration separately and keep the samples.
+            max_samples: Ceiling on retained samples; beyond it, reservoir
+                sampling replaces rather than appends.
+            seed: Reservoir RNG seed, fixed so a rerun keeps the same
+                positions.
+        """
         self.num_iters = num_iters
         self.elapsed = 0
         self.metric = None
         self.count = 0
+        self.sample_each = sample_each
+        self.max_samples = max_samples
+        self.samples_ns = List[Float64]()
+        self.samples_seen = 0
+        self._rng = seed if seed != 0 else UInt64(0x9E3779B97F4A7C15)
 
     def throughput(mut self, var metric: Metric, count: Int):
         """Declare how much work one iteration does, for the rate column.
@@ -283,25 +411,82 @@ struct Benchmark:
         self.metric = metric^
         self.count = count
 
+    def _offer(mut self, sample_ns: Float64):
+        """Algorithm R: every iteration keeps an equal chance of being kept.
+
+        The alternative -- retaining the first `max_samples` and dropping the
+        rest -- would take its percentiles from the start of the run, which is
+        the part most contaminated by cache warming.
+        """
+        self.samples_seen += 1
+        if len(self.samples_ns) < self.max_samples:
+            self.samples_ns.append(sample_ns)
+            return
+        var j = Int(_next_rand(self._rng) % UInt64(self.samples_seen))
+        if j < self.max_samples:
+            self.samples_ns[j] = sample_ns
+
     def iter[f: def() capturing raises -> None](mut self) raises:
-        """Run `f` `num_iters` times and record the elapsed nanoseconds."""
-        var t0 = perf_counter_ns()
+        """Run `f` `num_iters` times and record the elapsed nanoseconds.
+
+        Batched: one timer pair wraps the loop, so the clock's cost is divided
+        by `num_iters` and what comes out is a mean.
+
+        Per-iteration: each call is timed on its own, and every sample carries
+        the cost of one clock read. The suite only turns this on when an
+        iteration costs at least a hundred such reads, which puts that bias
+        under 1% -- far below the run-to-run spread the percentiles exist to
+        show. `elapsed` is then the sum of the samples, i.e. time inside `f`,
+        with the clock reads between iterations excluded.
+        """
+        if not self.sample_each:
+            var t0 = perf_counter_ns()
+            for _ in range(self.num_iters):
+                f()
+            self.elapsed = perf_counter_ns() - t0
+            return
+
+        var total = 0
         for _ in range(self.num_iters):
+            var t0 = perf_counter_ns()
             f()
-        self.elapsed = perf_counter_ns() - t0
+            var dt = perf_counter_ns() - t0
+            total += dt
+            self._offer(Float64(dt))
+        self.elapsed = total
 
 
 # ── Results ─────────────────────────────────────────────────────────────────
 
 
 struct BenchResult(Copyable, Movable):
-    """One benchmark's per-repetition timings, plus statistics over them."""
+    """One benchmark's timings, plus statistics over them.
+
+    Two vectors, and which one the statistics came from is the whole point:
+
+    * `runs_ns` -- one entry per repetition, each the mean nanoseconds per
+      iteration over that repetition. Always populated, always
+      `num_repetitions` long, which is three or five.
+    * `samples_ns` -- one entry per timed iteration, populated only when the
+      suite ran this benchmark in per-iteration mode. `per_iteration` says so;
+      `samples_seen` counts the iterations that were timed, which exceeds
+      `len(samples_ns)` when the reservoir cap bit.
+
+    Every statistic is computed over `samples_ns` in per-iteration mode and
+    over `runs_ns` otherwise. Percentiles are the exception that proves the
+    rule: they are `None` in batched mode rather than being computed over a
+    handful of repetition means, because a p90 over five averages would look
+    rigorous and describe nothing.
+    """
 
     var name: String
     var iters: Int
     var runs_ns: List[Float64]
     var metric: Optional[Metric]
     var count: Int
+    var samples_ns: List[Float64]
+    var per_iteration: Bool
+    var samples_seen: Int
 
     def __init__(
         out self,
@@ -311,78 +496,246 @@ struct BenchResult(Copyable, Movable):
         var metric: Optional[Metric],
         count: Int,
     ):
+        """A batched result: statistics over the per-repetition means."""
         self.name = name^
         self.iters = iters
         self.runs_ns = runs_ns^
         self.metric = metric^
         self.count = count
+        self.samples_ns = List[Float64]()
+        self.per_iteration = False
+        self.samples_seen = 0
+
+    @staticmethod
+    def sampled(
+        var name: String,
+        iters: Int,
+        var runs_ns: List[Float64],
+        var metric: Optional[Metric],
+        count: Int,
+        var samples_ns: List[Float64],
+        samples_seen: Int,
+    ) -> Self:
+        """A per-iteration result: statistics over individual iterations.
+
+        Args:
+            name: Benchmark name.
+            iters: Calibrated iterations per repetition.
+            runs_ns: Per-repetition means, kept so the JSON shape is unchanged.
+            metric: Throughput declaration, if the body made one.
+            count: Work units per iteration.
+            samples_ns: Retained per-iteration timings.
+            samples_seen: Iterations timed, which may exceed the retained
+                count.
+        """
+        var r = Self(name^, iters, runs_ns^, metric^, count)
+        r.samples_ns = samples_ns^
+        r.per_iteration = True
+        r.samples_seen = samples_seen
+        return r^
+
+    # -- what the statistics were computed over -----------------------------
+
+    def sampling(self) -> String:
+        """`per-iteration` or `batched` -- printed everywhere a number is."""
+        if self.per_iteration:
+            return String("per-iteration")
+        return String("batched")
+
+    def num_samples(self) -> Int:
+        """Retained per-iteration samples; zero in batched mode."""
+        return len(self.samples_ns)
+
+    def subsampled(self) -> Bool:
+        """True when the reservoir cap dropped some of what was timed."""
+        return self.per_iteration and self.samples_seen > len(self.samples_ns)
+
+    def has_percentiles(self) -> Bool:
+        return self.per_iteration and len(self.samples_ns) > 0
+
+    # -- statistics ---------------------------------------------------------
 
     def mean_ns(self) -> Float64:
-        if len(self.runs_ns) == 0:
-            return 0.0
-        var total = Float64(0)
-        for i in range(len(self.runs_ns)):
-            total += self.runs_ns[i]
-        return total / Float64(len(self.runs_ns))
+        if self.per_iteration:
+            return _mean(self.samples_ns)
+        return _mean(self.runs_ns)
 
     def min_ns(self) -> Float64:
-        if len(self.runs_ns) == 0:
-            return 0.0
-        var lo = self.runs_ns[0]
-        for i in range(1, len(self.runs_ns)):
-            if self.runs_ns[i] < lo:
-                lo = self.runs_ns[i]
-        return lo
+        if self.per_iteration:
+            return _min(self.samples_ns)
+        return _min(self.runs_ns)
 
     def max_ns(self) -> Float64:
-        if len(self.runs_ns) == 0:
-            return 0.0
-        var hi = self.runs_ns[0]
-        for i in range(1, len(self.runs_ns)):
-            if self.runs_ns[i] > hi:
-                hi = self.runs_ns[i]
-        return hi
+        if self.per_iteration:
+            return _max(self.samples_ns)
+        return _max(self.runs_ns)
 
     def median_ns(self) -> Float64:
-        var n = len(self.runs_ns)
-        if n == 0:
-            return 0.0
-        var s = _sorted(self.runs_ns)
-        if n % 2 == 1:
-            return s[n // 2]
-        return (s[n // 2 - 1] + s[n // 2]) / 2.0
+        if self.per_iteration:
+            return _percentile(self.samples_ns, 0.5)
+        return _percentile(self.runs_ns, 0.5)
 
     def stddev_ns(self) -> Float64:
         """Sample standard deviation (n-1), matching pytest-benchmark."""
-        var n = len(self.runs_ns)
-        if n < 2:
-            return 0.0
-        var m = self.mean_ns()
-        var acc = Float64(0)
-        for i in range(n):
-            var d = self.runs_ns[i] - m
-            acc += d * d
-        return sqrt(acc / Float64(n - 1))
+        if self.per_iteration:
+            return _stddev(self.samples_ns)
+        return _stddev(self.runs_ns)
+
+    def percentile_ns(self, q: Float64) -> Optional[Float64]:
+        """The `q` quantile over measured iterations, or `None`.
+
+        `None` is the answer in batched mode, and it is the honest one: there
+        is no per-iteration distribution to take a quantile of.
+
+        Args:
+            q: Fraction in [0, 1]. 0.5 for the median.
+        """
+        if not self.has_percentiles():
+            return None
+        return _percentile(self.samples_ns, q)
+
+    def p50_ns(self) -> Optional[Float64]:
+        return self.percentile_ns(0.5)
+
+    def p90_ns(self) -> Optional[Float64]:
+        return self.percentile_ns(0.9)
+
+    def p99_ns(self) -> Optional[Float64]:
+        return self.percentile_ns(0.99)
 
     def rate(self) -> Float64:
-        """Throughput in units of a billion per second, or 0 if undeclared."""
+        """Throughput in units of a billion per second, or 0 if undeclared.
+
+        Still against the mean, and deliberately: it is the one central value
+        both modes have, so a rate stays comparable across a run that switched
+        modes and across history recorded before the modes existed.
+        """
         var mean = self.mean_ns()
         if self.count == 0 or mean <= 0.0:
             return 0.0
         return Float64(self.count) / mean
 
 
+# ── Statistics over a sample vector ─────────────────────────────────────────
+
+
+def _mean(values: List[Float64]) -> Float64:
+    if len(values) == 0:
+        return 0.0
+    var total = Float64(0)
+    for i in range(len(values)):
+        total += values[i]
+    return total / Float64(len(values))
+
+
+def _min(values: List[Float64]) -> Float64:
+    if len(values) == 0:
+        return 0.0
+    var lo = values[0]
+    for i in range(1, len(values)):
+        if values[i] < lo:
+            lo = values[i]
+    return lo
+
+
+def _max(values: List[Float64]) -> Float64:
+    if len(values) == 0:
+        return 0.0
+    var hi = values[0]
+    for i in range(1, len(values)):
+        if values[i] > hi:
+            hi = values[i]
+    return hi
+
+
+def _stddev(values: List[Float64]) -> Float64:
+    var n = len(values)
+    if n < 2:
+        return 0.0
+    var m = _mean(values)
+    var acc = Float64(0)
+    for i in range(n):
+        var d = values[i] - m
+        acc += d * d
+    return sqrt(acc / Float64(n - 1))
+
+
+def _percentile(values: List[Float64], q: Float64) -> Float64:
+    """Linear interpolation between closest ranks, over a sorted copy.
+
+    This is numpy's default and pytest-benchmark's, so a p90 printed here means
+    what a p90 means elsewhere. `q` is a fraction: 0.5 is the median, and for
+    an even count it reduces to the average of the middle pair, which is what
+    `median_ns` reported before percentiles existed.
+
+    Zero for an empty vector, the single value for a vector of one.
+    """
+    var n = len(values)
+    if n == 0:
+        return 0.0
+    var qq = q
+    if qq < 0.0:
+        qq = 0.0
+    if qq > 1.0:
+        qq = 1.0
+    var s = _sorted(values)
+    if n == 1:
+        return s[0]
+    var h = qq * Float64(n - 1)
+    var lo = Int(h)
+    if lo >= n - 1:
+        return s[n - 1]
+    return s[lo] + (s[lo + 1] - s[lo]) * (h - Float64(lo))
+
+
+def _sift_down(mut a: List[Float64], var root: Int, size: Int):
+    while True:
+        var child = 2 * root + 1
+        if child >= size:
+            return
+        if child + 1 < size and a[child + 1] > a[child]:
+            child += 1
+        if a[root] >= a[child]:
+            return
+        var swap = a[root]
+        a[root] = a[child]
+        a[child] = swap
+        root = child
+
+
+comptime _INSERTION_SORT_MAX = 48
+"""Above this, `_sorted` switches to heapsort."""
+
+
 def _sorted(values: List[Float64]) -> List[Float64]:
-    """Insertion sort. Repetition counts are single digits; nothing else fits
-    better, and it avoids depending on a `List.sort` that keeps moving."""
+    """Ascending copy, leaving the input alone.
+
+    Insertion sort for the handful of numbers a batched run produces. Above
+    `_INSERTION_SORT_MAX` -- which is to say once per-iteration sampling makes
+    the vector thousands long -- heapsort, because O(n^2) over twenty thousand
+    samples would cost more than the benchmark it is summarising and there is
+    still no `List.sort` here that stays put across toolchains.
+    """
     var out = values.copy()
-    for i in range(1, len(out)):
-        var v = out[i]
-        var j = i - 1
-        while j >= 0 and out[j] > v:
-            out[j + 1] = out[j]
-            j -= 1
-        out[j + 1] = v
+    var n = len(out)
+
+    if n <= _INSERTION_SORT_MAX:
+        for i in range(1, n):
+            var v = out[i]
+            var j = i - 1
+            while j >= 0 and out[j] > v:
+                out[j + 1] = out[j]
+                j -= 1
+            out[j + 1] = v
+        return out^
+
+    for start in range(n // 2 - 1, -1, -1):
+        _sift_down(out, start, n)
+    for end in range(n - 1, 0, -1):
+        var swap = out[0]
+        out[0] = out[end]
+        out[end] = swap
+        _sift_down(out, 0, end)
     return out^
 
 
@@ -400,6 +753,10 @@ struct _Bench(Copyable):
 # ── The suite ───────────────────────────────────────────────────────────────
 
 
+comptime _RESERVOIR_SEED = UInt64(0x9E3779B97F4A7C15)
+"""Fixed, and offset per repetition, so a rerun keeps the same positions."""
+
+
 struct BenchSuite(Movable):
     """Discovers `bench_*` functions, filters them, runs them, reports."""
 
@@ -413,6 +770,10 @@ struct BenchSuite(Movable):
     var num_warmup_iters: Int
     var num_repetitions: Int
     var max_iters: Int
+    var max_samples: Int
+    var resolution_factor: Int
+    var force_batched: Bool
+    var timer_resolution_ns: Float64
 
     def __init__(
         out self,
@@ -421,7 +782,22 @@ struct BenchSuite(Movable):
         num_warmup_iters: Int = 2,
         num_repetitions: Int = 5,
         max_iters: Int = 100_000_000,
+        max_samples: Int = 20_000,
+        resolution_factor: Int = 100,
     ):
+        """Configure a suite.
+
+        Args:
+            min_runtime_secs: Calibration target for one repetition.
+            num_warmup_iters: Untimed passes before calibrating.
+            num_repetitions: Timed repetitions; each becomes a `runs_ns` entry.
+            max_iters: Ceiling on the calibrated iteration count.
+            max_samples: Ceiling on retained per-iteration samples, split
+                evenly across repetitions. Zero disables per-iteration
+                sampling entirely.
+            resolution_factor: How many clock reads one iteration must cost
+                before it is worth timing on its own.
+        """
         self.benches = List[_Bench]()
         self.only = List[String]()
         self.skip = List[String]()
@@ -432,6 +808,12 @@ struct BenchSuite(Movable):
         self.num_warmup_iters = num_warmup_iters
         self.num_repetitions = num_repetitions
         self.max_iters = max_iters
+        self.max_samples = max_samples
+        self.resolution_factor = resolution_factor
+        self.force_batched = False
+        # Measured once, here, so every benchmark is judged against the same
+        # number and the report can say what it was.
+        self.timer_resolution_ns = _timer_resolution_ns()
 
     # -- discovery ----------------------------------------------------------
 
@@ -459,6 +841,8 @@ struct BenchSuite(Movable):
         num_warmup_iters: Int = 2,
         num_repetitions: Int = 5,
         max_iters: Int = 100_000_000,
+        max_samples: Int = 20_000,
+        resolution_factor: Int = 100,
     ) raises:
         """Discover every `bench_*` in the module, then parse argv and run.
 
@@ -470,12 +854,17 @@ struct BenchSuite(Movable):
             num_warmup_iters: Untimed passes before calibrating.
             num_repetitions: Timed repetitions; each becomes a reported run.
             max_iters: Ceiling on the calibrated iteration count.
+            max_samples: Ceiling on retained per-iteration samples.
+            resolution_factor: How many clock reads one iteration must cost
+                before it is timed on its own.
         """
         var suite = Self(
             min_runtime_secs=min_runtime_secs,
             num_warmup_iters=num_warmup_iters,
             num_repetitions=num_repetitions,
             max_iters=max_iters,
+            max_samples=max_samples,
+            resolution_factor=resolution_factor,
         )
         suite._discover[funcs]()
         suite.execute()
@@ -493,6 +882,11 @@ struct BenchSuite(Movable):
                 mode = String("")
             elif arg == "--json":
                 self.json = True
+                mode = String("")
+            elif arg == "--batched":
+                # An escape hatch, mostly for reproducing a number recorded
+                # before per-iteration sampling existed.
+                self.force_batched = True
                 mode = String("")
             elif arg == "--out":
                 if i + 1 >= len(args):
@@ -548,7 +942,34 @@ struct BenchSuite(Movable):
             ', "num_warmup_iters": ', self.num_warmup_iters,
             ', "num_repetitions": ', self.num_repetitions,
             ', "max_iters": ', self.max_iters,
+            ', "max_samples": ', self.max_samples,
+            ', "resolution_factor": ', self.resolution_factor,
+            ', "timer_resolution_ns": ', self.timer_resolution_ns,
+            ', "force_batched": ', "true" if self.force_batched else "false",
             "}",
+        )
+
+    def _samples_per_iteration(self, per_iter_ns: Float64) -> Bool:
+        """Whether one iteration is expensive enough to time on its own.
+
+        `timer_resolution_ns` was measured on this machine at construction, so
+        this is a comparison against a real number rather than a guess.
+        Demanding `resolution_factor` clock ticks' worth of work per iteration
+        (100 by default) holds the clock's own contribution -- its cost, and
+        more importantly its quantisation -- under 1% of a sample, an order of
+        magnitude below the run-to-run spread the percentiles exist to expose.
+        Cheaper than that and batching is the only way to measure the thing at
+        all, so the harness batches and reports no percentile rather than a
+        fabricated one.
+
+        Args:
+            per_iter_ns: Calibrated cost of one iteration.
+        """
+        if self.force_batched or self.max_samples <= 0:
+            return False
+        return (
+            per_iter_ns
+            >= Float64(self.resolution_factor) * self.timer_resolution_ns
         )
 
     # -- execution ----------------------------------------------------------
@@ -579,9 +1000,12 @@ struct BenchSuite(Movable):
         # repetitions are shorter than `min_runtime_secs`, which is the right
         # trade -- a benchmark that cheap is measuring loop overhead anyway.
         var num_iters = 1
+        # Set on every pass of the loop below, which always runs at least once.
+        var per_iter_ns: Float64
         while True:
             var cal = Benchmark(num_iters)
             b.bench_fn(cal)
+            per_iter_ns = Float64(cal.elapsed) / Float64(num_iters)
             if cal.elapsed >= target_ns or num_iters >= self.max_iters:
                 break
             if cal.elapsed <= 0:
@@ -596,12 +1020,44 @@ struct BenchSuite(Movable):
                 )
                 num_iters = min(max(Int(scaled), num_iters + 1), self.max_iters)
 
+        # The calibrated cost of one iteration decides how the repetitions are
+        # timed. Splitting the sample budget evenly across repetitions rather
+        # than pooling one reservoir over all of them keeps each repetition
+        # equally represented, which matters because a repetition is the unit a
+        # scheduler hiccup lands in.
+        var per_iteration = self._samples_per_iteration(per_iter_ns)
+        var budget = 0
+        if per_iteration:
+            budget = self.max_samples // self.num_repetitions
+            if budget < 1:
+                budget = 1
+
         var runs_ns = List[Float64](capacity=self.num_repetitions)
-        for _ in range(self.num_repetitions):
-            var rep = Benchmark(num_iters)
+        var samples = List[Float64]()
+        var seen = 0
+        for rep_index in range(self.num_repetitions):
+            var rep = Benchmark(
+                num_iters,
+                sample_each=per_iteration,
+                max_samples=budget,
+                seed=_RESERVOIR_SEED + UInt64(rep_index),
+            )
             b.bench_fn(rep)
             runs_ns.append(Float64(rep.elapsed) / Float64(num_iters))
+            for i in range(len(rep.samples_ns)):
+                samples.append(rep.samples_ns[i])
+            seen += rep.samples_seen
 
+        if per_iteration and len(samples) > 0:
+            return BenchResult.sampled(
+                String(b.name),
+                num_iters,
+                runs_ns^,
+                metric^,
+                count,
+                samples^,
+                seen,
+            )
         return BenchResult(
             String(b.name), num_iters, runs_ns^, metric^, count
         )
@@ -631,6 +1087,15 @@ struct BenchSuite(Movable):
             print(payload)
         else:
             print(host.summary())
+            print(
+                "clock:",
+                _format_ns(self.timer_resolution_ns),
+                "resolution; per-iteration sampling above",
+                _format_ns(
+                    Float64(self.resolution_factor) * self.timer_resolution_ns
+                ),
+                "per iteration",
+            )
             print(_table(results))
         if self.out_path.byte_length() > 0:
             with open(self.out_path, "w") as f:
@@ -672,7 +1137,19 @@ def _json_report(
 
 
 def _json_results(results: List[BenchResult]) -> String:
-    """The measurements, in the order the benchmarks ran."""
+    """The measurements, in the order the benchmarks ran.
+
+    `sampling` says what every other number in the object was computed over,
+    and it is always present. `p50_ns`, `p90_ns`, `p99_ns`, `samples` and
+    `samples_seen` appear only on a per-iteration result -- omitted rather than
+    null, the same way the `throughput_*` fields are omitted when no metric was
+    declared, so a consumer that finds a percentile key knows it was measured.
+
+    The per-iteration samples themselves are not dumped: twenty thousand floats
+    per benchmark would dwarf the rest of the report, and the statistics are
+    what a document or a trend line reads. `runs_ns` keeps its old meaning and
+    its old length -- one entry per repetition -- in both modes.
+    """
     var out = String("[\n")
     for i in range(len(results)):
         ref r = results[i]
@@ -680,11 +1157,18 @@ def _json_results(results: List[BenchResult]) -> String:
         out += ', "unit": "ns"'
         out += ", " + '"iters": ' + String(r.iters)
         out += ", " + '"reps": ' + String(len(r.runs_ns))
+        out += ", " + '"sampling": "' + r.sampling() + '"'
         out += ", " + '"mean_ns": ' + String(r.mean_ns())
         out += ", " + '"min_ns": ' + String(r.min_ns())
         out += ", " + '"max_ns": ' + String(r.max_ns())
         out += ", " + '"median_ns": ' + String(r.median_ns())
         out += ", " + '"stddev_ns": ' + String(r.stddev_ns())
+        if r.has_percentiles():
+            out += ", " + '"p50_ns": ' + String(r.p50_ns().value())
+            out += ", " + '"p90_ns": ' + String(r.p90_ns().value())
+            out += ", " + '"p99_ns": ' + String(r.p99_ns().value())
+            out += ", " + '"samples": ' + String(r.num_samples())
+            out += ", " + '"samples_seen": ' + String(r.samples_seen)
         out += ", " + '"runs_ns": ['
         for j in range(len(r.runs_ns)):
             if j > 0:
@@ -772,11 +1256,42 @@ def _pad(var s: String, width: Int) -> String:
     return s^
 
 
+def _sampling_cell(r: BenchResult) -> String:
+    """`iters x reps`, plus what those iterations were actually timed with.
+
+    A row has to be self-describing: pasted into a README it is separated from
+    every other clue about how it was produced. `batched` means the numbers
+    beside it are over repetition means and there are no percentiles;
+    `per-iter` means they are over individual iterations. When the reservoir
+    cap bit, the kept-of-seen count goes here too, because a percentile over a
+    subsample is honest only when it says it is one.
+    """
+    var cell = String(r.iters, " x ", len(r.runs_ns))
+    if not r.per_iteration:
+        return cell + " batched"
+    cell += " per-iter"
+    if r.subsampled():
+        cell += String(
+            " (", r.num_samples(), " of ", r.samples_seen, " kept)"
+        )
+    return cell^
+
+
 def _table(results: List[BenchResult]) -> String:
-    """A markdown table: mean, spread, repetition count, and the rate."""
-    comptime NCOL = 5
+    """A markdown table: the p50 headline, p90 beside it, the floor and the
+    ceiling, how it was sampled, and the rate.
+
+    `p50` and `p90` read `n/a` on a batched row and the sampling column says
+    why -- see `_sampling_cell`. `mean` stays because it is the one central
+    value both modes have and the rate is derived from it, and because the gap
+    between it and the p50 is itself the finding: one 125 ms first call among
+    two hundred 2 ms ones moves a mean by 30% and a median not at all.
+    """
+    comptime NCOL = 7
     var headers = List[String]()
     headers.append(String("benchmark"))
+    headers.append(String("p50"))
+    headers.append(String("p90"))
     headers.append(String("mean"))
     headers.append(String("min - max"))
     headers.append(String("iters x reps"))
@@ -787,9 +1302,13 @@ def _table(results: List[BenchResult]) -> String:
         ref r = results[i]
         var row = List[String]()
         row.append(String(r.name))
+        var p50 = r.p50_ns()
+        var p90 = r.p90_ns()
+        row.append(_format_ns(p50.value()) if p50 else String("n/a"))
+        row.append(_format_ns(p90.value()) if p90 else String("n/a"))
         row.append(_format_ns(r.mean_ns()))
         row.append(_format_ns(r.min_ns()) + " - " + _format_ns(r.max_ns()))
-        row.append(String(r.iters) + " x " + String(len(r.runs_ns)))
+        row.append(_sampling_cell(r))
         if r.metric:
             row.append(_scaled_rate(r.rate(), r.metric.value().base_unit))
         else:

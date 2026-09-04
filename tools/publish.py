@@ -84,6 +84,11 @@ def result_entry(r: dict) -> dict:
     the per-commit snapshot, and carrying them in the rolling file would make
     it tens of megabytes for no gain on a trend line. `stddev_ns` is what the
     dashboard needs from them.
+
+    `sampling` and the percentiles come through when the report carries them.
+    They are absent from a batched result, and the missing-key filter below is
+    what preserves that rather than substituting a zero: a history entry with
+    no `p90_ns` measured no p90.
     """
     keep = (
         "mean_ns",
@@ -91,6 +96,12 @@ def result_entry(r: dict) -> dict:
         "max_ns",
         "median_ns",
         "stddev_ns",
+        "p50_ns",
+        "p90_ns",
+        "p99_ns",
+        "sampling",
+        "samples",
+        "samples_seen",
         "iters",
         "reps",
         "throughput",

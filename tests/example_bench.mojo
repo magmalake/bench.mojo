@@ -9,7 +9,10 @@ recursive, so they pass explicit tuples instead.
 
 from bench import Benchmark, BenchSuite, Metric, keep
 
-comptime N = 1 << 16
+# Large enough that one iteration costs comfortably more than a hundred clock
+# ticks, so `scripts/check_cli.sh` exercises the per-iteration sampling path
+# rather than only the batched one; `--batched` covers the other.
+comptime N = 1 << 19
 
 
 def _make(n: Int) -> List[Int64]:
