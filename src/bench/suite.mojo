@@ -177,8 +177,7 @@ struct Host(Copyable, Movable):
         var cpu = String("")
         var memory = 0
 
-        @parameter
-        if CompilationTarget.is_macos():
+        comptime if CompilationTarget.is_macos():
             cpu = _sysctl_str("machdep.cpu.brand_string")
             memory = _sysctl_u64("hw.memsize")
         elif CompilationTarget.is_linux():
@@ -199,8 +198,7 @@ struct Host(Copyable, Movable):
 
         var os = String("unknown")
 
-        @parameter
-        if CompilationTarget.is_macos():
+        comptime if CompilationTarget.is_macos():
             os = String("macos")
         elif CompilationTarget.is_linux():
             os = String("linux")
@@ -211,8 +209,7 @@ struct Host(Copyable, Movable):
         # on a GitHub macOS runner, leaving arch "unknown" and poisoning the
         # host key. Every arm64 target has NEON, which is the property we
         # actually mean here.
-        @parameter
-        if CompilationTarget.is_x86():
+        comptime if CompilationTarget.is_x86():
             arch = String("x86_64")
         elif CompilationTarget.has_neon():
             arch = String("arm64")

@@ -1,4 +1,4 @@
-"""bench — a small self-hosted benchmark harness for Mojo.
+"""`bench` — a small self-hosted benchmark harness for Mojo.
 
 Discovers `bench_*` functions in a module, calibrates an iteration count,
 times several repetitions, and reports a table or JSON. Works on stable Mojo

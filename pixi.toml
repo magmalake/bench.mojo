@@ -2,7 +2,7 @@
 authors = ["Marius S <39998+winding-lines@users.noreply.github.com>"]
 channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "bench.mojo"
-version = "0.1.0"
+version = "0.1.1"
 description = "A small self-hosted benchmark harness for Mojo — discovery, calibration, repetitions, JSON."
 preview = ["pixi-build"]
 platforms = ["osx-arm64", "linux-64"]
@@ -21,7 +21,7 @@ lint = { cmd = "mojolint --lsp -I src src tests" }
 # Conda package name is bench-mojo; the Mojo import stays `from bench import …`.
 [package]
 name = "bench-mojo"
-version = "0.1.0"
+version = "0.1.1"
 
 [package.build]
 backend = { name = "pixi-build-mojo", version = "0.*" }
