@@ -1027,7 +1027,7 @@ struct BenchSuite(Movable):
         # scheduler hiccup lands in.
         var per_iteration = self._samples_per_iteration(per_iter_ns)
         var budget = 0
-        if per_iteration:
+        if per_iteration and self.num_repetitions > 0:
             budget = self.max_samples // self.num_repetitions
             if budget < 1:
                 budget = 1
