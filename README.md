@@ -441,8 +441,7 @@ bench = ["stable", "bench"]
 
 Consume the **package** on stable, or the **source** on either.
 
-A precompiled Mojo package (`.mojoc` — `.mojopkg` is the deprecated spelling,
-as is `mojo package` for `mojo precompile`) is stamped with the exact compiler
+A precompiled Mojo package `.mojoc` is stamped with the exact compiler
 version that produced it and refused by any other:
 
 ```
