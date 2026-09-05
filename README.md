@@ -404,6 +404,15 @@ has to move further before it is called out. Where a benchmark declares a
 throughput the comparison uses it; otherwise it uses the reciprocal of the
 mean time, so a fall is always the bad direction.
 
+**The page does not get taller as benchmarks are added.** Above 800px it is
+the dense view: the table, then every benchmark's trend in two columns. Below
+it — a phone — the table stays and the trends become *one* chart with a
+picker, so the "over time" section is the same height at forty benchmarks as
+at four. Clicking a benchmark's name in the table opens its chart, on either
+layout. Chart heights come from CSS (`.chart__canvas`), which is what stops a
+`maintainAspectRatio: false` canvas from taking its own height as the input to
+its next resize.
+
 Repositories in this org get all of it from one caller workflow — see
 `.github/workflows/bench.yml` in any of the tins.
 
