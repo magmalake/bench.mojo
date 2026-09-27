@@ -7,12 +7,14 @@ older toolchain, and the pieces it leans on have since moved.
 
 Why not `std.benchmark`? Two reasons, one hard and one soft.
 
-The hard one: `Bencher.iter` has lost its parameter form on nightly, and the
-value form that remains will not accept a `@parameter` closure -- while a
-plain closure cannot infer a capture convention on either toolchain. So on
-nightly, `std.benchmark` cannot express a benchmark that reads data it did not
-construct inside the timed region. Owning the ~60 lines that actually do the
-timing sidesteps that, and this file compiles on stable 1.0.0 and nightly.
+The hard one, as of 1.0.0: `Bencher.iter` had lost its parameter form on
+nightly, and the value form that remained would not accept a `@parameter`
+closure -- while a plain closure could not infer a capture convention on
+either toolchain. So `std.benchmark` could not express a benchmark that reads
+data it did not construct inside the timed region. Owning the ~60 lines that
+actually do the timing sidesteps that. Mojo 1.1.0's explicit capture lists
+(`def call() raises {imm data}:`) are what `Benchmark.iter` takes now, and
+`@parameter` itself is deprecated.
 
 The soft one: `Bench.dump_report` gives a mean and nothing else. Reports need
 the spread, so `_run_one` keeps every per-repetition timing and the JSON
@@ -93,13 +95,11 @@ Writing a benchmark::
         var data = _make_buffer(SIZE)
         b.throughput(Metric.bytes(), SIZE)
 
-        @parameter
-        def call() raises:
+        def call() raises {imm data}:
             var h = crc32(Span(data))
             keep(h)
 
-        b.iter[call]()
-        keep(data)
+        b.iter(call)
 
     def main() raises:
         BenchSuite.run[__functions_in_module()]()
@@ -597,8 +597,13 @@ struct Benchmark:
         if j < self.max_samples:
             self.samples_ns[j] = sample_ns
 
-    def iter[f: def() capturing raises -> None](mut self) raises:
+    def iter[F: def() raises -> None](mut self, f: F) raises:
         """Run `f` `num_iters` times and record the elapsed nanoseconds.
+
+        `f` is a closure value with an explicit capture list, typically
+        `def call() raises {imm data}:`. Non-raising closures bind too. The
+        closure's type is a parameter, so each call site is still
+        monomorphised and `f()` is a direct call, not an indirect one.
 
         Batched: one timer pair wraps the loop, so the clock's cost is divided
         by `num_iters` and what comes out is a mean.
