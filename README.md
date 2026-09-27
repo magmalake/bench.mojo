@@ -454,7 +454,7 @@ Mojo compiler. Precompiled file 'bench.mojoc' version 1.0.0 is older than
 compiler version 1.1.0.dev2026090105.
 ```
 
-magmalake tins build with `mojo-compiler 1.0.0`, so a tin consumed as a
+magmalake tins build with `mojo-compiler 1.1.0`, so a tin consumed as a
 package is stable-only — an org-wide constraint that has nothing to do with
 this harness. Vendoring the source (`-I ../bench.mojo/src`) works on both, and
 that is what this repo's own CI does.
@@ -462,7 +462,7 @@ that is what this repo's own CI does.
 ## Test
 
 ```sh
-pixi run -e stable test         # stable Mojo 1.0.0
+pixi run -e stable test         # stable Mojo 1.1.0
 pixi run -e default test        # nightly
 pixi run -e stable check-cli    # drives every flag against a built binary
 pixi run -e stable example      # the worked example in tests/
