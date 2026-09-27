@@ -9,6 +9,7 @@ that asserts on wall-clock is a test that fails on a busy CI runner.
 from std.testing import (
     TestSuite,
     assert_equal,
+    assert_raises,
     assert_true,
     assert_almost_equal,
 )
@@ -283,23 +284,42 @@ def test_iter_runs_the_closure_exactly_num_iters_times() raises:
     var calls = 0
     var b = Benchmark(7)
 
-    @parameter
-    def call() raises:
+    def call() raises {mut calls}:
         calls += 1
 
-    b.iter[call]()
+    b.iter(call)
     assert_equal(calls, 7)
     assert_true(b.elapsed >= 0)
+
+
+def test_iter_accepts_a_non_raising_closure() raises:
+    var calls = 0
+    var b = Benchmark(3)
+
+    def call() {mut calls}:
+        calls += 1
+
+    b.iter(call)
+    assert_equal(calls, 3)
+
+
+def test_iter_propagates_what_the_closure_raises() raises:
+    var b = Benchmark(3)
+
+    def call() raises {}:
+        raise Error("from the body")
+
+    with assert_raises(contains="from the body"):
+        b.iter(call)
 
 
 def test_iter_keeps_one_sample_per_iteration_when_asked() raises:
     var b = Benchmark(7, sample_each=True, max_samples=100)
 
-    @parameter
-    def call() raises:
+    def call() raises {}:
         keep(1)
 
-    b.iter[call]()
+    b.iter(call)
     assert_equal(len(b.samples_ns), 7)
     assert_equal(b.samples_seen, 7)
     # `elapsed` is the sum of the samples, so the per-repetition mean the suite
@@ -313,11 +333,10 @@ def test_iter_keeps_one_sample_per_iteration_when_asked() raises:
 def test_iter_keeps_no_samples_in_batched_mode() raises:
     var b = Benchmark(7)
 
-    @parameter
-    def call() raises:
+    def call() raises {}:
         keep(1)
 
-    b.iter[call]()
+    b.iter(call)
     assert_equal(len(b.samples_ns), 0)
     assert_equal(b.samples_seen, 0)
     assert_true(b.elapsed >= 0)
@@ -328,11 +347,10 @@ def test_reservoir_caps_retained_samples_but_counts_every_one() raises:
     is bounded and `samples_seen` still says what the percentiles are over."""
     var b = Benchmark(500, sample_each=True, max_samples=16)
 
-    @parameter
-    def call() raises:
+    def call() raises {}:
         keep(1)
 
-    b.iter[call]()
+    b.iter(call)
     assert_equal(len(b.samples_ns), 16)
     assert_equal(b.samples_seen, 500)
 
@@ -799,19 +817,17 @@ def _helper_not_a_bench(x: Int) -> Int:
 
 
 def bench_one(mut b: Benchmark) raises:
-    @parameter
-    def call() raises:
+    def call() raises {}:
         keep(1)
 
-    b.iter[call]()
+    b.iter(call)
 
 
 def bench_two(mut b: Benchmark) raises:
-    @parameter
-    def call() raises:
+    def call() raises {}:
         keep(2)
 
-    b.iter[call]()
+    b.iter(call)
 
 
 def bench_measurable(mut b: Benchmark) raises:
@@ -826,14 +842,13 @@ def bench_measurable(mut b: Benchmark) raises:
     for i in range(50_000):
         data.append(Int64(i))
 
-    @parameter
-    def call() raises:
+    def call() raises {imm data}:
         var total = Int64(0)
         for i in range(len(data)):
             total += data[i]
         keep(total)
 
-    b.iter[call]()
+    b.iter(call)
     keep(data)
 
 

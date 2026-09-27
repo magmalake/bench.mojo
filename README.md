@@ -19,13 +19,11 @@ def bench_crc32(mut b: Benchmark) raises:
     var data = _make_buffer(SIZE)        # setup is outside iter, so untimed
     b.throughput(Metric.bytes(), SIZE)
 
-    @parameter
-    def call() raises:
+    def call() raises {imm data}:        # capture list: read `data` by reference
         var h = crc32(Span(data))
         keep(h)                          # stop the optimiser deleting the work
 
-    b.iter[call]()
-    keep(data)
+    b.iter(call)
 
 
 def main() raises:
@@ -45,14 +43,20 @@ clock: 1.00 us resolution; per-iteration sampling above 100.00 us per iteration
 
 Two reasons, one hard and one soft.
 
-**The hard one.** `Bencher.iter` has lost its parameter form on nightly, and
-the value form that remains will not accept a `@parameter` closure — while a
-plain closure cannot infer a capture convention on *either* toolchain
+**The hard one, as of Mojo 1.0.0.** `Bencher.iter` had lost its parameter
+form on nightly, and the value form that remained would not accept a
+`@parameter` closure — while a plain closure could not infer a capture
+convention on *either* toolchain
 (`Could not infer capture convention of the captured value`). Together those
-mean nightly `std.benchmark` cannot express a benchmark that reads data it did
-not construct inside the timed region, which is most of them. Owning the sixty
-lines that actually do the timing sidesteps the whole problem, and this
-harness compiles unchanged on stable 1.0.0 and nightly.
+meant nightly `std.benchmark` could not express a benchmark that reads data it
+did not construct inside the timed region, which is most of them. Owning the
+sixty lines that actually do the timing sidesteps the whole problem.
+
+Mojo 1.1.0 added explicit capture lists and deprecated `@parameter`, so since
+0.5.0 `Benchmark.iter` takes the closure as a value — `b.iter(call)` with
+`def call() raises {imm data}:` — rather than as a `@parameter` closure in a
+parameter position. The closure's type is still a parameter, so the call is
+monomorphised and direct.
 
 **The soft one.** `Bench.dump_report` gives you a mean. A mean cannot tell you
 whether a 4% move is a regression or the machine being busy, so `_run_one`
@@ -347,31 +351,31 @@ type-equality predicate on either toolchain right now, so a `bench_*` helper
 with a different signature is a compile error rather than a silent skip —
 prefix helpers with `_`.
 
-**`keep` everything the timed closure captures, after `b.iter`.** Mojo
-destroys a value at its last *use*, and a capture does not count — so a
-schema, a selection list, or a buffer that the closure reads but the body
-never mentions again is freed while the timed loop is still running. It
-surfaces as a crash or as nonsense inside the library under test, not as a
-lifetime error:
+**Capture explicitly, and the captures stay alive.** A closure with a capture
+list holds a real reference to what it names, with that value's origin, so
+`{imm file, imm select}` keeps both alive until `b.iter` returns:
 
 ```mojo
 def bench_read(mut b: Benchmark) raises:
     var file = build()
     var select: List[String] = ["id"]
 
-    @parameter
-    def call() raises:
+    def call() raises {imm file, imm select}:
         keep(read(file, select.copy()))
 
-    b.iter[call]()
-    keep(file)        # both of these are load-bearing
-    keep(select)      # without it, `select` dies mid-benchmark
+    b.iter(call)
 ```
 
-The rule: after `b.iter`, `keep` every variable the closure touched. It costs
-nothing and the failure mode is ugly — one of these missing produced
-`String span ends on 1 which is not a codepoint boundary` from deep inside a
-decoder.
+Before 0.5.0 this section said the opposite, because it had to: a legacy
+`@parameter` capture does not count as a use, so Mojo destroyed a captured
+value at its last *visible* use, which could be before the timed loop even
+started. It surfaced as a crash or as nonsense deep inside the library under
+test — once as `String span ends on 1 which is not a codepoint boundary` from a
+decoder — and the workaround was to `keep` every captured variable after
+`b.iter`. Checked on 1.1.0 and nightly with a type that logs its destructor:
+the legacy closure's capture is destroyed before `iter` starts and the body
+reads a dead value; the `{imm …}` capture is destroyed after `iter` returns.
+A trailing `keep` is now redundant, and harmless.
 
 **Benchmark names are the function names minus nothing.** `bench_crc32`
 reports as `bench_crc32`; that is what `--only` takes and what lands in the

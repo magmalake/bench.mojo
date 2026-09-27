@@ -2,7 +2,7 @@
 
 Discovers `bench_*` functions in a module, calibrates an iteration count,
 times several repetitions, and reports a table or JSON. Works on stable Mojo
-1.0.0 and nightly, which `std.benchmark` currently does not.
+1.1.0 and nightly, which `std.benchmark` currently does not.
 
     from bench import Benchmark, BenchSuite, Metric, keep
 
@@ -10,12 +10,10 @@ times several repetitions, and reports a table or JSON. Works on stable Mojo
         var data = build(1 << 20)
         b.throughput(Metric.elements(), 1 << 20)
 
-        @parameter
-        def call() raises:
+        def call() raises {imm data}:
             keep(total(data))
 
-        b.iter[call]()
-        keep(data)
+        b.iter(call)
 
     def main() raises:
         BenchSuite.run[__functions_in_module()]()

@@ -30,14 +30,13 @@ def bench_sum(mut b: Benchmark) raises:
     var data = _make(N)
     b.throughput(Metric.elements(), N)
 
-    @parameter
-    def call() raises:
+    def call() raises {imm data}:
         var total = Int64(0)
         for i in range(len(data)):
             total += data[i]
         keep(total)
 
-    b.iter[call]()
+    b.iter(call)
     keep(data)
 
 
@@ -45,15 +44,14 @@ def bench_max(mut b: Benchmark) raises:
     var data = _make(N)
     b.throughput(Metric.elements(), N)
 
-    @parameter
-    def call() raises:
+    def call() raises {imm data}:
         var hi = Int64(0)
         for i in range(len(data)):
             if data[i] > hi:
                 hi = data[i]
         keep(hi)
 
-    b.iter[call]()
+    b.iter(call)
     keep(data)
 
 
