@@ -40,7 +40,7 @@ mojo-compiler = "==1.1.0"
 mojo-compiler = ">=1.1.0,<2"
 
 [feature.nightly.dependencies]
-modular = ">=26.7.0.dev2026092005,<28"
+modular = ">=26.7.0.dev2026101905,<28"
 
 [feature.stable.dependencies]
 mojo-compiler = "==1.1.0"
