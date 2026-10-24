@@ -1352,47 +1352,48 @@ struct BenchSuite(Movable):
         var mode = String("")
         while i < len(args):
             var arg = String(args[i])
-            if arg == "--list":
-                self.list_only = True
-                mode = String("")
-            elif arg == "--json":
-                self.json = True
-                mode = String("")
-            elif arg == "--batched":
-                # An escape hatch, mostly for reproducing a number recorded
-                # before per-iteration sampling existed.
-                self.force_batched = True
-                mode = String("")
-            elif arg == "--strict":
-                self.strict = True
-                mode = String("")
-            elif arg == "--no-recheck":
-                self.recheck = False
-                mode = String("")
-            elif arg == "--recheck":
-                self.recheck = True
-                mode = String("")
-            elif arg == "--out":
-                if i + 1 >= len(args):
-                    raise Error("--out needs a path")
-                self.out_path = String(args[i + 1])
-                i += 1
-                mode = String("")
-            elif arg == "--only":
-                mode = String("only")
-            elif arg == "--skip":
-                mode = String("skip")
-            elif arg.startswith("--"):
-                raise Error("unknown flag: ", arg)
-            elif mode == "only":
-                self.only.append(arg)
-            elif mode == "skip":
-                self.skip.append(arg)
-            else:
-                raise Error(
-                    "unexpected argument: ", arg, " (expected --only or --skip"
-                    " first)"
-                )
+            match arg:
+                case "--list":
+                    self.list_only = True
+                    mode = String("")
+                case "--json":
+                    self.json = True
+                    mode = String("")
+                case "--batched":
+                    # An escape hatch, mostly for reproducing a number recorded
+                    # before per-iteration sampling existed.
+                    self.force_batched = True
+                    mode = String("")
+                case "--strict":
+                    self.strict = True
+                    mode = String("")
+                case "--no-recheck":
+                    self.recheck = False
+                    mode = String("")
+                case "--recheck":
+                    self.recheck = True
+                    mode = String("")
+                case "--out":
+                    if i + 1 >= len(args):
+                        raise Error("--out needs a path")
+                    self.out_path = String(args[i + 1])
+                    i += 1
+                    mode = String("")
+                case "--only":
+                    mode = String("only")
+                case "--skip":
+                    mode = String("skip")
+                case a if a.startswith("--"):
+                    raise Error("unknown flag: ", arg)
+                case _ if mode == "only":
+                    self.only.append(arg)
+                case _ if mode == "skip":
+                    self.skip.append(arg)
+                case _:
+                    raise Error(
+                        "unexpected argument: ", arg, " (expected --only or --skip"
+                        " first)"
+                    )
             i += 1
 
         # Fail loudly on a typo rather than silently running nothing.
