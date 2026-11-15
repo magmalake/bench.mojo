@@ -25,5 +25,5 @@ from .suite import (
     BenchSuite,
     Metric,
     Stability,
-    keep,
 )
+from std.benchmark.compiler import keep
