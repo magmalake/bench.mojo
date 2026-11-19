@@ -31,25 +31,20 @@ path = "src/bench"
 name = "bench"
 
 [package.host-dependencies]
-mojo-compiler = "==1.2.0"
+mojo-compiler = "==1.3.0.dev2026111805"
 
 [package.build-dependencies]
-mojo-compiler = "==1.2.0"
+mojo-compiler = "==1.3.0.dev2026111805"
 
 [package.run-dependencies]
-mojo-compiler = ">=1.2.0,<2"
+mojo-compiler = "==1.3.0.dev2026111805"
 
-[feature.nightly.dependencies]
-modular = ">=26.8.0.dev2026102305,<28"
-
-[feature.stable.dependencies]
-mojo-compiler = "==1.2.0"
-
-[environments]
-default = ["nightly"]
-stable = ["stable"]
-
+# One toolchain: the tin, its tests and every consumer use the same Mojo
+# nightly. A precompiled Mojo package (.mojoc) loads only in the compiler
+# version that built it, so the pin is exact here and in [package] above, and
+# it moves across all magmalake tins together.
 [dependencies]
+mojo-compiler = "==1.3.0.dev2026111805"
 # Added by `pixi shelf add lint-mojo`: the linter comes from GitHub as a pixi
 # source dependency pinned at the revision mojoshelf published, and builds
 # the `mojolint` executable into every environment next to mojo-lsp-server.

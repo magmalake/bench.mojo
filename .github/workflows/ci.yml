@@ -7,13 +7,12 @@ on:
 
 jobs:
   test:
-    name: ${{ matrix.env == 'default' && 'nightly' || matrix.env }} / ${{ matrix.os }}
+    name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        env: [default, stable]
     steps:
       - uses: actions/checkout@v4
 
@@ -22,18 +21,17 @@ jobs:
           # Pinned: the lock file is written by 0.78.0, and an unpinned pixi
           # rejects it as "lock file not up-to-date with the workspace".
           pixi-version: v0.78.0
-          environments: ${{ matrix.env }}
 
       - name: Unit tests
-        run: pixi run -e ${{ matrix.env }} test
+        run: pixi run test
 
       - name: Lint (mojolint --lsp)
-        run: pixi run -e ${{ matrix.env }} lint
+        run: pixi run lint
 
       # Covers the __functions_in_module() discovery path and every CLI flag,
       # which the unit tests cannot reach — see tests/example_bench.mojo.
       - name: CLI
-        run: pixi run -e ${{ matrix.env }} check-cli
+        run: pixi run check-cli
 
   # Imports: no cycles between modules, and each name imported from the
   # module that defines it (github.com/magmalake/customs).
