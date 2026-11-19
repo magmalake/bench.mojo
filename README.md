@@ -440,10 +440,8 @@ bench-mojo = { git = "https://github.com/magmalake/bench.mojo", rev = "..." }
 bench = "mojo run -I src -I $CONDA_PREFIX/lib/mojo bench/bench_mine.mojo"
 
 [environments]
-bench = ["stable", "bench"]
+bench = ["bench"]
 ```
-
-Consume the **package** on stable, or the **source** on either.
 
 A precompiled Mojo package `.mojoc` is stamped with the exact compiler
 version that produced it and refused by any other:
@@ -454,18 +452,17 @@ Mojo compiler. Precompiled file 'bench.mojoc' version 1.0.0 is older than
 compiler version 1.1.0.dev2026090105.
 ```
 
-magmalake tins build with `mojo-compiler 1.2.0`, so a tin consumed as a
-package is stable-only — an org-wide constraint that has nothing to do with
-this harness. Vendoring the source (`-I ../bench.mojo/src`) works on both, and
-that is what this repo's own CI does.
+magmalake tins all build with one pinned Mojo nightly,
+`mojo-compiler ==1.3.0.dev2026111805`, and a workspace that consumes this tin
+as a package needs that same pin. Vendoring the source
+(`-I ../bench.mojo/src`) works with any compiler the source compiles on.
 
 ## Test
 
 ```sh
-pixi run -e stable test         # stable Mojo 1.2.0
-pixi run -e default test        # nightly
-pixi run -e stable check-cli    # drives every flag against a built binary
-pixi run -e stable example      # the worked example in tests/
+pixi run test         # Mojo 1.3.0.dev2026111805
+pixi run check-cli    # drives every flag against a built binary
+pixi run example      # the worked example in tests/
 ```
 
 `tests/example_bench.mojo` is the only place `__functions_in_module()` is

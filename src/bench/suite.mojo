@@ -170,7 +170,7 @@ struct Metric(Copyable, Movable):
 # ── the machine ─────────────────────────────────────────────────────────────
 
 
-def _cstr(s: StringSlice) -> List[UInt8]:
+def _cstr(s: StringSpan) -> List[UInt8]:
     var out = List[UInt8]()
     for b in String(s).as_bytes():
         out.append(b)
@@ -178,7 +178,7 @@ def _cstr(s: StringSlice) -> List[UInt8]:
     return out^
 
 
-def _sysctl_str(name: StringSlice) -> String:
+def _sysctl_str(name: StringSpan) -> String:
     """macOS only. Empty string on any failure -- unknown beats invented."""
     var key = _cstr(name)
     var size = List[UInt64](length=1, fill=UInt64(512))
@@ -196,7 +196,7 @@ def _sysctl_str(name: StringSlice) -> String:
     return out^
 
 
-def _sysctl_u64(name: StringSlice) -> Int:
+def _sysctl_u64(name: StringSpan) -> Int:
     var key = _cstr(name)
     var size = List[UInt64](length=1, fill=UInt64(8))
     var val = List[UInt64](length=1, fill=UInt64(0))
@@ -206,13 +206,13 @@ def _sysctl_u64(name: StringSlice) -> Int:
     return Int(val[0]) if rc == 0 else 0
 
 
-def _proc_field(path: StringSlice, key: StringSlice) -> String:
+def _proc_field(path: StringSpan, key: StringSpan) -> String:
     """First `key: value` line of a /proc file. Empty on any failure."""
     try:
         with open(String(path), "r") as f:
             var text = f.read()
             for line in text.split("\n"):
-                var colon = line.find(":")
+                var colon = line.find(":").or_else(-1)
                 if colon < 0:
                     continue
                 if String(line[byte = 0 : colon]).strip() == String(key):
@@ -990,7 +990,7 @@ def _proc_load_average() -> Float64:
     try:
         with open("/proc/loadavg", "r") as f:
             var text = f.read()
-            var space = text.find(" ")
+            var space = text.find(" ").or_else(-1)
             if space <= 0:
                 return -1.0
             return Float64(String(text[byte=0:space]))
@@ -1975,7 +1975,7 @@ def _round(v: Float64, places: Int) -> String:
         factor *= 10.0
     var scaled = round(v * factor) / factor
     var s = String(scaled)
-    var dot = s.find(".")
+    var dot = s.find(".").or_else(-1)
     if dot < 0:
         s += "."
         dot = s.byte_length() - 1
