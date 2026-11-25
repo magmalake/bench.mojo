@@ -1,5 +1,7 @@
 # bench.mojo
 
+[![Used by](https://mojourney.dev/badge/magmalake/bench.mojo/used-by.svg)](https://mojourney.dev/repos/magmalake/bench.mojo#used-by) [![Mojo version](https://mojourney.dev/badge/magmalake/bench.mojo/mojo.svg)](https://mojourney.dev/repos/magmalake/bench.mojo)
+
 A small self-hosted benchmark harness for Mojo: discovers the benchmarks in a
 file, calibrates an iteration count, times several repetitions, and prints a
 table or a JSON array.
