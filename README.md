@@ -453,14 +453,14 @@ compiler version 1.1.0.dev2026090105.
 ```
 
 magmalake tins all build with one pinned Mojo nightly,
-`mojo-compiler ==1.3.0.dev2026111805`, and a workspace that consumes this tin
+`mojo-compiler ==1.3.0.dev2026112505`, and a workspace that consumes this tin
 as a package needs that same pin. Vendoring the source
 (`-I ../bench.mojo/src`) works with any compiler the source compiles on.
 
 ## Test
 
 ```sh
-pixi run test         # Mojo 1.3.0.dev2026111805
+pixi run test         # Mojo 1.3.0.dev2026112505
 pixi run check-cli    # drives every flag against a built binary
 pixi run example      # the worked example in tests/
 ```
